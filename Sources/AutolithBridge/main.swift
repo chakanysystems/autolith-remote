@@ -1,0 +1,201 @@
+import Foundation
+import Network
+import Security
+import BridgeCore
+
+// The listener accepts loopback only. Tailscale Serve owns remote HTTPS.
+let environment = ProcessInfo.processInfo.environment
+let executable = environment["AUTOLITH_EXECUTABLE"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".nix-profile/bin/autolith").path
+let backend = BackendPool(executable: executable)
+let transcripts = TranscriptService()
+guard let tokenPath = environment["AUTOLITH_BRIDGE_TOKEN_FILE"] else {
+    fputs("Set AUTOLITH_BRIDGE_TOKEN_FILE to a private file containing a random token.\n", stderr); exit(64)
+}
+let attributes = try FileManager.default.attributesOfItem(atPath: tokenPath)
+guard (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600,
+      (attributes[.ownerAccountID] as? NSNumber)?.uint32Value == getuid(),
+      attributes[.type] as? FileAttributeType == .typeRegular else {
+    fputs("Token file must be a regular file owned by you with mode 0600.\n", stderr); exit(64)
+}
+let token = try String(contentsOfFile: tokenPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+guard token.utf8.count >= 32 else { fputs("Token must contain at least 32 random characters.\n", stderr); exit(64) }
+let queue = DispatchQueue(label: "autolith.bridge")
+let workers = DispatchQueue(label: "autolith.operations", attributes: .concurrent)
+let slots = DispatchSemaphore(value: 4)
+let streamSlots = DispatchSemaphore(value: 4)
+
+func authorized(_ authorization: String) -> Bool {
+    let supplied = Array(authorization.utf8), expected = Array("Bearer \(token)".utf8)
+    var difference = supplied.count ^ expected.count
+    for index in expected.indices { difference |= Int(expected[index] ^ (index < supplied.count ? supplied[index] : 0)) }
+    return difference == 0
+}
+let parameters = NWParameters.tcp
+// Override the loopback port for isolated integration tests or a second companion.
+let port = NWEndpoint.Port(rawValue: UInt16(environment["AUTOLITH_BRIDGE_PORT"] ?? "4318") ?? 4318)!
+parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: port)
+let listener = try NWListener(using: parameters)
+
+let pushService = try PushService(environment: environment) {
+    try executeAutolith(Data("{\"operation\":\"list\"}".utf8))
+}
+let messageService = try MessageService(file: URL(fileURLWithPath: tokenPath).deletingLastPathComponent().appendingPathComponent("messages/outbox.json")) { object in
+    let data = try executeAutolith(JSONSerialization.data(withJSONObject: object))
+    guard let result = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw BridgeError.invalid("Invalid backend response.") }
+    if let error = result["error"] as? String { throw BridgeError.invalid(error) }
+    return result
+}
+let alertService = try AlertPushService(file: URL(fileURLWithPath: tokenPath).deletingLastPathComponent().appendingPathComponent("messages/devices.json"), push: pushService) { object in
+    let data = try executeAutolith(JSONSerialization.data(withJSONObject: object))
+    guard let result = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw BridgeError.invalid("Invalid backend response.") }
+    if let error = result["error"] as? String { throw BridgeError.invalid(error) }
+    return result
+}
+
+let idleTimeoutText = environment["AUTOLITH_IDLE_SESSION_TIMEOUT_SECONDS"] ?? "1800"
+guard let idleTimeout = Double(idleTimeoutText), idleTimeout.isFinite, idleTimeout >= 60 else {
+    fputs("AUTOLITH_IDLE_SESSION_TIMEOUT_SECONDS must be at least 60.\n", stderr); exit(64)
+}
+let idleSessions = IdleSessionService(timeout: idleTimeout) { object in
+    let data = try execute(JSONSerialization.data(withJSONObject: object))
+    guard let reply = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        throw BridgeError.invalid("Invalid cleanup response")
+    }
+    if let error = reply["error"] as? String { throw BridgeError.invalid(error) }
+    return reply
+}
+
+func execute(_ body: Data) throws -> Data {
+    if let object = try JSONSerialization.jsonObject(with: body) as? [String: Any] {
+        if let operation = object["operation"] as? String,
+           ["tell", "resume", "message-send", "pause"].contains(operation),
+           let id = object["id"] as? String { idleSessions.activity(id) }
+        if let result = try messageService.handle(object) {
+            if object["operation"] as? String == "message-send", let id = object["id"] as? String {
+                do { try alertService.watch(id) } catch { fputs("Could not register response notification watch.\n", stderr) }
+            }
+            return try JSONSerialization.data(withJSONObject: result)
+        }
+        if object["operation"] as? String == "notification-register" {
+            try alertService.register(object)
+            return Data("{\"ok\":true}".utf8)
+        }
+        if object["operation"] as? String == "transcript-sync", let id = object["id"] as? String {
+            let raw = try executeAutolith(JSONSerialization.data(withJSONObject: ["operation": "transcript", "id": id, "after": 0]))
+            let reply = try JSONSerialization.jsonObject(with: raw) as? [String: Any] ?? [:]
+            if reply["error"] != nil { return raw }
+            let decorated = messageService.decorateTranscript(reply, sessionID: id)
+            return try JSONSerialization.data(withJSONObject: transcripts.response(sessionID: id, events: decorated["events"] as? [[String: Any]] ?? [], revision: object["revision"] as? String))
+        }
+        if object["operation"] as? String == "transcript", let id = object["id"] as? String {
+            let reply = try JSONSerialization.jsonObject(with: executeAutolith(body)) as? [String: Any] ?? [:]
+            return try JSONSerialization.data(withJSONObject: messageService.decorateTranscript(reply, sessionID: id))
+        }
+        if object["operation"] as? String == "list" {
+            var reply = try JSONSerialization.jsonObject(with: executeAutolith(body)) as? [String: Any] ?? [:]
+            var sessions = reply["sessions"] as? [[String: Any]] ?? []
+            for i in sessions.indices {
+                if let id = sessions[i]["id"] as? String {
+                    let pending = messageService.outbox.pending(sessionID: id).filter { $0.state == "queued" || $0.state == "dispatching" }.count
+                    sessions[i]["queued"] = (sessions[i]["queued"] as? Int ?? 0) + pending
+                }
+            }
+            reply["sessions"] = sessions
+            return try JSONSerialization.data(withJSONObject: reply)
+        }
+        if object["operation"] as? String == "browse" {
+            return try JSONSerialization.data(withJSONObject: WorkspaceBrowser.listing(path: object["path"] as? String))
+        }
+        if object["operation"] as? String == "capabilities" {
+            return try JSONSerialization.data(withJSONObject: ["pushEnabled": pushService.enabled, "eventStreamVersion": 1, "transcriptSyncVersion": 1])
+        }
+        if object["operation"] as? String == "activity-register" {
+            try pushService.register(object)
+            return Data("{\"ok\":true}".utf8)
+        }
+    }
+    return try executeAutolith(body)
+}
+
+func executeAutolith(_ body: Data) throws -> Data {
+    guard let object = try JSONSerialization.jsonObject(with: body) as? [String: Any],
+          let operation = object["operation"] as? String,
+          ["list", "create", "resume", "transcript", "tell", "pause", "kill", "stop-idle", "delete", "catalog"].contains(operation) else { throw BridgeError.invalid("Unsupported operation") }
+    return try backend.call(JSONSerialization.data(withJSONObject: object))
+}
+
+final class Client {
+    let connection: NWConnection
+    var data = Data()
+    var finished = false
+    var stream: EventStream?
+    func disconnected() { stream?.stop(); stream = nil }
+    init(_ connection: NWConnection) { self.connection = connection }
+    func reply(_ status: Int, _ body: Data) {
+        guard !finished else { return }; finished = true
+        let head = "HTTP/1.1 \(status) Response\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+        connection.send(content: Data(head.utf8) + body, completion: .contentProcessed { _ in self.connection.cancel() })
+    }
+    func fail(_ status: Int, _ text: String) { reply(status, (try? JSONSerialization.data(withJSONObject: ["error": text])) ?? Data()) }
+    func receive() {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { bytes, _, ended, error in
+            guard !self.finished else { return }
+            if let bytes { self.data.append(bytes) }
+            do {
+                if self.data.starts(with: Data("GET ".utf8)) {
+                    if let upgrade = try WebSocketUpgrade.parse(self.data) {
+                        guard authorized(upgrade.authorization) else { self.fail(401, "Invalid companion token"); return }
+                        let headers = String(decoding: self.data.prefix(upgrade.consumedBytes), as: UTF8.self)
+                        guard !headers.components(separatedBy: "\r\n").dropFirst().contains(where: { $0.lowercased().hasPrefix("origin:") }) else {
+                            self.fail(403, "Browser event streams are not supported"); return
+                        }
+                        guard streamSlots.wait(timeout: .now()) == .success else { self.fail(503, "Too many event streams"); return }
+                        self.finished = true
+                        let stream = EventStream(connection: self.connection, queue: queue, executable: executable) { streamSlots.signal() }
+                        self.stream = stream
+                        let remainder = Data(self.data.dropFirst(upgrade.consumedBytes))
+                        self.data.removeAll()
+                        stream.start(response: upgrade.response, remainder: remainder)
+                    } else if ended || error != nil { self.connection.cancel() }
+                    else { self.receive() }
+                } else if self.data.count < 4 && !ended && error == nil {
+                    self.receive()
+                } else if let request = try HTTPRequest.parse(self.data) {
+                    guard authorized(request.authorization) else { self.fail(401, "Invalid companion token"); return }
+                    guard slots.wait(timeout: .now()) == .success else { self.fail(503, "Companion is busy"); return }
+                    workers.async {
+                        defer { slots.signal() }
+                        do { let response = try execute(request.body); queue.async { self.reply(200, response) } }
+                        catch { let message = error.localizedDescription; queue.async { self.fail(502, message) } }
+                    }
+                } else if ended || error != nil { self.connection.cancel() }
+                else { self.receive() }
+            } catch { self.fail(400, error.localizedDescription) }
+        }
+    }
+}
+var activeConnections = 0
+listener.newConnectionHandler = { connection in
+    guard activeConnections < 32 else { connection.cancel(); return }
+    activeConnections += 1
+    let client = Client(connection)
+    connection.stateUpdateHandler = { state in
+        switch state {
+        case .cancelled:
+            activeConnections -= 1; client.disconnected(); connection.stateUpdateHandler = nil
+        case .failed: client.disconnected(); connection.cancel()
+        default: break
+        }
+    }
+    connection.start(queue: queue)
+    client.receive()
+    queue.asyncAfter(deadline: .now() + 70) { [weak client] in
+        if let client, !client.finished { client.fail(408, "Request timed out") }
+    }
+}
+listener.stateUpdateHandler = { state in
+    if case .failed(let error) = state { fputs("Listener failed: \(error)\n", stderr); exit(1) }
+    if case .ready = state { print("Autolith companion listening on 127.0.0.1:\(listener.port?.rawValue ?? port.rawValue). Expose with Tailscale Serve HTTPS.") }
+}
+listener.start(queue: queue)
+dispatchMain()

@@ -1,0 +1,3 @@
+// swift-tools-version: 5.10
+import PackageDescription
+let package = Package(name: "AutolithCompanion", platforms: [.macOS(.v14)], products: [.executable(name: "autolith-bridge", targets: ["AutolithBridge"])], targets: [.target(name: "ClientCore", path: "Shared"), .testTarget(name: "ClientCoreTests", dependencies: ["ClientCore"]), .target(name: "BridgeCore"), .executableTarget(name: "AutolithBridge", dependencies: ["BridgeCore", "ClientCore"]), .testTarget(name: "BridgeCoreTests", dependencies: ["BridgeCore"]), .testTarget(name: "MessageServiceTests", dependencies: ["AutolithBridge", "ClientCore"]), .testTarget(name: "EventStreamTests", dependencies: ["AutolithBridge"])])

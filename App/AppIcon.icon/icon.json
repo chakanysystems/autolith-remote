@@ -1,0 +1,57 @@
+{
+  "fill" : {
+    "linear-gradient" : [
+      "extended-srgb:0.04706,0.27059,0.18431,1.00000",
+      "extended-srgb:0.00784,0.04314,0.03137,1.00000"
+    ]
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "glass" : true,
+          "image-name" : "row-1.svg",
+          "name" : "Startup row 1"
+        },
+        {
+          "glass" : true,
+          "image-name" : "row-2.svg",
+          "name" : "Startup row 2"
+        },
+        {
+          "glass" : true,
+          "image-name" : "row-3.svg",
+          "name" : "Startup row 3"
+        },
+        {
+          "glass" : true,
+          "image-name" : "row-4.svg",
+          "name" : "Startup row 4"
+        },
+        {
+          "glass" : true,
+          "image-name" : "row-5.svg",
+          "name" : "Startup row 5"
+        },
+        {
+          "glass" : true,
+          "image-name" : "row-6.svg",
+          "name" : "Startup row 6"
+        }
+      ],
+      "name" : "Cosmic AL",
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.8
+      },
+      "specular" : true,
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.25
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "squares" : "shared"
+  }
+}
