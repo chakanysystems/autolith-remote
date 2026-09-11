@@ -16,116 +16,34 @@ final class EventStreamTests: XCTestCase {
         XCTAssertThrowsError(try EventStream.subscription(#"{"operation":"tell","id":"s"}"#))
     }
 
-    func testAuthenticatedNativeStreamAndDisconnectCleanup() throws {
-        let snapshot = #"{"version":1,"type":"snapshot","sessionID":"s","epoch":"e","sequence":1,"status":{"id":"s"},"activity":[]}"#
-        let event = #"{"version":1,"type":"event","sessionID":"s","epoch":"e","sequence":2,"kind":"job","payload":{"state":"running"}}"#
-        let fixture = try Fixture(script: "read -r request\nprintf '%s' \"$request\" > \"$TEST_REQUEST\"\necho $$ > \"$TEST_PID\"\nprintf '%s\\n' 'boot diagnostic' '\(snapshot)' '\(event)'\nexec \(fixtureSleepPath()) 30\n")
+    func testAuthenticatedPollingStream() throws {
+        let fixture = try Fixture()
         defer { fixture.stop() }
         let unauthorized = try fixture.connect()
         defer { close(unauthorized) }
         try write(unauthorized, Data(fixture.handshake(token: "incorrect").utf8))
         XCTAssertTrue(try header(unauthorized).hasPrefix("HTTP/1.1 401"))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.pidFile.path))
         let browser = try fixture.connect()
         defer { close(browser) }
         try write(browser, Data(fixture.handshake(origin: true).utf8))
         XCTAssertTrue(try header(browser).hasPrefix("HTTP/1.1 403"))
         let socket = try fixture.connect()
         defer { close(socket) }
-        // Include a masked first message in the upgrade packet to exercise byte handoff.
-        let request = #"{"operation":"subscribe","id":"s","epoch":"old","after":3}"#
-        try write(socket, Data(fixture.handshake().utf8) + masked(request))
-        XCTAssertTrue(try header(socket).hasPrefix("HTTP/1.1 101"))
-        XCTAssertEqual(try frame(socket).1, snapshot)
-        XCTAssertEqual(try frame(socket).1, event)
-        let forwarded = try JSONSerialization.jsonObject(with: Data(contentsOf: fixture.requestFile)) as? NSDictionary
-        XCTAssertEqual(forwarded, try JSONSerialization.jsonObject(with: Data(request.utf8)) as? NSDictionary)
-        let pid = try XCTUnwrap(Int32(String(contentsOf: fixture.pidFile).trimmingCharacters(in: .whitespacesAndNewlines)))
-        XCTAssertEqual(kill(pid, 0), 0, "Events must arrive while backend is still running")
-        shutdown(socket, Int32(SHUT_RDWR))
-        try assertProcessTerminates(pid, timeout: 5)
-    }
-
-    func testLegacyBackendErrorIsDelivered() throws {
-        let fixture = try Fixture(script: "read -r request\nprintf '%s\\n' 'boot diagnostic' '{\"error\":\"Unsupported operation\"}'\n")
-        defer { fixture.stop() }
-        let socket = try fixture.connect()
-        defer { close(socket) }
-        try write(socket, Data(fixture.handshake().utf8))
-        XCTAssertTrue(try header(socket).hasPrefix("HTTP/1.1 101"))
-        try write(socket, masked(#"{"operation":"subscribe","id":"s"}"#))
-        let response = try frame(socket)
-        XCTAssertEqual(response.0, 1)
-        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.1.utf8)) as? [String: Any])
-        XCTAssertEqual(object["type"] as? String, "error")
-        XCTAssertEqual(object["error"] as? String, "Unsupported operation")
-        XCTAssertEqual(try frame(socket).0, 8)
-    }
-
-    func testMalformedOrCrossSessionNativeEventsAreRejected() throws {
-        let snapshot = #"{"version":1,"type":"snapshot","sessionID":"s","epoch":"e","sequence":0,"status":{"id":"s"},"activity":[]}"#
-        for event in [
-            #"{"version":1,"type":"event","sessionID":"other","epoch":"e","sequence":1,"kind":"activity","payload":{}}"#,
-            #"{"version":1,"type":"event","sessionID":"s","epoch":"e","sequence":2,"kind":"activity","payload":{}}"#,
-            #"{"version":1,"type":"event","sessionID":"s","epoch":"e","sequence":true,"kind":"activity","payload":{}}"#
-        ] {
-            let fixture = try Fixture(script: "read -r request\nprintf '%s\\n' '\(snapshot)' '\(event)'\n")
-            defer { fixture.stop() }
-            let socket = try fixture.connect()
-            defer { close(socket) }
-            try write(socket, Data(fixture.handshake().utf8) + masked(#"{"operation":"subscribe","id":"s"}"#))
-            XCTAssertTrue(try header(socket).hasPrefix("HTTP/1.1 101"))
-            XCTAssertEqual(try frame(socket).1, snapshot)
-            let response = try JSONSerialization.jsonObject(with: Data(frame(socket).1.utf8)) as? [String: Any]
-            XCTAssertEqual(response?["type"] as? String, "error")
-            XCTAssertEqual(try frame(socket).0, 8)
-        }
-    }
-
-    func testDisconnectKillsDescendantAfterLauncherExitsWithOpenPipe() throws {
-        let snapshot = #"{"version":1,"type":"snapshot","sessionID":"s","epoch":"e","sequence":0,"status":{"id":"s"},"activity":[]}"#
-        let fixture = try Fixture(script: "read -r request\n\(fixtureSleepPath()) 30 &\necho $! > \"$TEST_PID\"\nprintf '%s\\n' '\(snapshot)'\nexit 0\n")
-        defer { fixture.stop() }
-        let socket = try fixture.connect()
-        defer { close(socket) }
+        // Include the first masked message in the upgrade packet to test byte handoff.
         try write(socket, Data(fixture.handshake().utf8) + masked(#"{"operation":"subscribe","id":"s"}"#))
         XCTAssertTrue(try header(socket).hasPrefix("HTTP/1.1 101"))
-        XCTAssertEqual(try frame(socket).1, snapshot)
-        let pid = try XCTUnwrap(Int32(String(contentsOf: fixture.pidFile).trimmingCharacters(in: .whitespacesAndNewlines)))
-        Thread.sleep(forTimeInterval: 0.1)
+        let first = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(frame(socket).1.utf8)) as? [String: Any])
+        let second = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(frame(socket).1.utf8)) as? [String: Any])
+        XCTAssertEqual(first["type"] as? String, "snapshot")
+        XCTAssertEqual(first["sessionID"] as? String, "s")
+        XCTAssertEqual(first["sequence"] as? Int, 1)
+        XCTAssertEqual(second["sequence"] as? Int, 2)
+        XCTAssertEqual(first["epoch"] as? String, second["epoch"] as? String)
         shutdown(socket, Int32(SHUT_RDWR))
-        try assertProcessTerminates(pid, timeout: 3)
-    }
-
-    func testDisconnectCancelsSubscriptionWithBackendThatNeverReadsOrWrites() throws {
-        let fixture = try Fixture(script: "echo $$ > \"$TEST_PID\"\nexec \(fixtureSleepPath()) 30\n")
-        defer { fixture.stop() }
-        let socket = try fixture.connect()
-        defer { close(socket) }
-        try write(socket, Data(fixture.handshake().utf8) + masked(#"{"operation":"subscribe","id":"s"}"#))
-        XCTAssertTrue(try header(socket).hasPrefix("HTTP/1.1 101"))
-        let startup = Date().addingTimeInterval(3)
-        while !FileManager.default.fileExists(atPath: fixture.pidFile.path) && Date() < startup { Thread.sleep(forTimeInterval: 0.01) }
-        let pid = try XCTUnwrap(Int32(String(contentsOf: fixture.pidFile).trimmingCharacters(in: .whitespacesAndNewlines)))
-        shutdown(socket, Int32(SHUT_RDWR))
-        try assertProcessTerminates(pid, timeout: 3)
-    }
-
-    func testUnterminatedBackendEnvelopeIsRejected() throws {
-        let snapshot = #"{"version":1,"type":"snapshot","sessionID":"s","epoch":"e","sequence":0,"status":{"id":"s"},"activity":[]}"#
-        let fixture = try Fixture(script: "read -r request\nprintf '%s' '\(snapshot)'\n")
-        defer { fixture.stop() }
-        let socket = try fixture.connect()
-        defer { close(socket) }
-        try write(socket, Data(fixture.handshake().utf8) + masked(#"{"operation":"subscribe","id":"s"}"#))
-        XCTAssertTrue(try header(socket).hasPrefix("HTTP/1.1 101"))
-        let response = try JSONSerialization.jsonObject(with: Data(frame(socket).1.utf8)) as? [String: Any]
-        XCTAssertEqual(response?["type"] as? String, "error")
-        XCTAssertEqual(try frame(socket).0, 8)
     }
 
     func testRPCHalfClosedInputStillReceivesResponse() throws {
-        let fixture = try Fixture(script: "exit 0\n")
+        let fixture = try Fixture()
         defer { fixture.stop() }
         let socket = try fixture.connect()
         defer { close(socket) }
@@ -141,7 +59,7 @@ final class EventStreamTests: XCTestCase {
     }
 
     func testRPCBodyAcrossMultipleTransportReads() throws {
-        let fixture = try Fixture(script: "exit 0\n")
+        let fixture = try Fixture()
         defer { fixture.stop() }
         let socket = try fixture.connect()
         defer { close(socket) }
@@ -154,7 +72,7 @@ final class EventStreamTests: XCTestCase {
     }
 
     func testStreamLimitDoesNotBlockRPC() throws {
-        let fixture = try Fixture(script: "exit 0\n")
+        let fixture = try Fixture()
         defer { fixture.stop() }
         var sockets: [Int32] = []
         defer { sockets.forEach { close($0) } }
@@ -223,16 +141,24 @@ final class EventStreamTests: XCTestCase {
         let process = Process()
         let port = UInt16.random(in: 30000...60000)
         let token = UUID().uuidString + UUID().uuidString
-        var pidFile: URL { directory.appendingPathComponent("pid") }
-        var requestFile: URL { directory.appendingPathComponent("request") }
-        init(script: String) throws {
-            directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            let tokenFile = directory.appendingPathComponent("token"), native = directory.appendingPathComponent("native")
+        let management: ManagementTestServer
+        init() throws {
+            management = try ManagementTestServer()
+            directory = management.directory
+            let tokenFile = directory.appendingPathComponent("bridge-token")
             try token.write(to: tokenFile, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tokenFile.path)
-            try ("#!\(try fixtureShellPath())\n" + script).write(to: native, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: native.path)
+            let server = management
+            server.serve { socket in
+                try server.authenticate(socket)
+                while true {
+                    let form: ManagementForm
+                    do { form = try server.receive(socket) } catch { return }
+                    let request = try ManagementTestServer.request(form)
+                    if request["operation"] as? String == "identity" { try server.reply(socket, ["id": "gateway"]) }
+                    else { try server.reply(socket, ["sessions": [["id": "s", "state": "idle"]]]) }
+                }
+            }
             // Use this test run's product, including custom SwiftPM scratch paths.
             #if os(macOS)
             let products = Bundle(for: EventStreamTests.self).bundleURL.deletingLastPathComponent()
@@ -242,9 +168,9 @@ final class EventStreamTests: XCTestCase {
             process.executableURL = products.appendingPathComponent("autolith-bridge")
             var env = ProcessInfo.processInfo.environment
             env["AUTOLITH_BRIDGE_TOKEN_FILE"] = tokenFile.path
-            env["AUTOLITH_EXECUTABLE"] = native.path
+            env["AUTOLITH_MANAGEMENT_REPL_UNIX_SOCKET"] = management.path
+            env["AUTOLITH_MANAGEMENT_REPL_TOKEN_FILE"] = management.tokenPath
             env["AUTOLITH_BRIDGE_PORT"] = String(port)
-            env["TEST_PID"] = pidFile.path; env["TEST_REQUEST"] = requestFile.path
             process.environment = env
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.standardError
@@ -290,9 +216,8 @@ final class EventStreamTests: XCTestCase {
             throw Failure()
         }
         func stop() {
-            if let contents = try? String(contentsOf: pidFile), let pid = Int32(contents.trimmingCharacters(in: .whitespacesAndNewlines)) { kill(pid, SIGKILL) }
             if process.isRunning { process.terminate(); process.waitUntilExit() }
-            try? FileManager.default.removeItem(at: directory)
+            management.stop()
         }
     }
 }

@@ -90,6 +90,7 @@ stdenv.mkDerivation {
   installPhase = ''
     runHook preInstall
     install -Dm755 "$(swiftpmBinPath)/autolith-bridge" "$out/bin/autolith-bridge"
+    cp -R "$(swiftpmBinPath)/AutolithCompanion_AutolithBridge.${if stdenv.hostPlatform.isDarwin then "bundle" else "resources"}" "$out/bin/"
     install -Dm644 LICENSE "$out/share/licenses/autolith-bridge/LICENSE"
     runHook postInstall
   '';

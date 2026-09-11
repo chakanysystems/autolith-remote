@@ -20,36 +20,42 @@ Connect Tailscale on the Mac and iPad. In the app, enter your Mac's Tailscale HT
 
 ## Companion bridge
 
-The Swift companion requires a mobile-enabled Autolith build with `autolith mobile`. It exchanges one JSON request and response per line, or a native activity subscription. The companion verifies `rpc-handshake` protocol version 1 and keeps up to four backend processes warm. Update the backend and companion together. Requests with uncertain delivery are never automatically replayed. It reuses localgroup discovery/control and the read-only conversation replay projection.
+Run the bridge on macOS 14+ or Linux with glibc 2.34+. It uses SwiftNIO for loopback TCP, bounded HTTP/WebSocket parsers, and Swift Crypto on Linux. Run the backend on the same host. For a non-Nix build, install a Swift 5.10-compatible toolchain with Clang and Foundation/Dispatch libraries.
+The companion connects to Autolith's existing HMAC-authenticated management REPL over a private Unix socket. It sends bounded lexical Lisp requests that call existing session and replay functions. It does not require `autolith mobile`, a patched harness, or a new iPhone/iPad app. Use Autolith 0.49.0 or newer. Requests with uncertain delivery are never automatically replayed.
 
-Run the bridge on macOS 14+ or Linux with glibc 2.34+. It uses SwiftNIO for loopback TCP, the shared bounded HTTP/WebSocket parsers, and Swift Crypto on Linux. The backend must run on the same host. For a non-Nix build, install a Swift 5.10-compatible toolchain with Clang and its Foundation/Dispatch libraries.
-
-1. Build the companion with `swift build -c release`.
-2. Build a mobile-enabled Autolith checkout with its documented bootstrap or Nix build.
-3. Generate a random token of at least 32 characters in an owned mode-0600 regular file, inside an owned mode-0700 directory. Credential files and their immediate directory must not grant access through ACLs. Ancestors must be owned by you or root and not writable by other users, except trusted sticky directories.
-4. Set the executable and token paths, verify the handshake, and start the companion:
+1. Build the companion with `swift build -c release`. Keep `AutolithCompanion_AutolithBridge.bundle` alongside the executable when copying it elsewhere.
+2. Create two separate private token files: one for the phone-facing companion and one for management RPC. Keep both in a directory owned by you with mode 0700. Each file must be owned by you with mode 0600. The companion token must contain at least 32 random characters; the management token contains 1 to 4096 raw bytes and must match exactly, including any newline.
+3. Start an ordinary, dedicated Autolith session as the gateway in one terminal:
 
    ```sh
-   export AUTOLITH_EXECUTABLE=/absolute/path/to/autolith
+   export AUTOLITH_MANAGEMENT_REPL=on
+   export AUTOLITH_MANAGEMENT_REPL_TRANSPORT=unix
+   export AUTOLITH_MANAGEMENT_REPL_UNIX_SOCKET="$HOME/.local/state/autolith-mobile/rpc/gateway.sock"
+   export AUTOLITH_MANAGEMENT_REPL_TOKEN_FILE="$HOME/.local/state/autolith-mobile/management-token"
+   export AUTOLITH_MANAGEMENT_REPL_TIMEOUT=60
+   export AUTOLITH_MANAGEMENT_REPL_MAX_OUTPUT=8388608
+   export AUTOLITH_MANAGEMENT_REPL_MAX_FRAME=33554432
+   AUTOLITH_SESSION_STYLE=direct autolith --permissions ask
+   ```
+
+   Keep this dedicated gateway running. It is hidden from the phone's session list. Management RPC evaluates trusted Lisp with the host user's privileges. Store its token on the host; do not give it to the phone or expose the socket through Tailscale. The larger bounded output limit accommodates conversation history. A response exceeding the limit fails explicitly.
+4. Start the companion in another terminal, using the same socket and management-token paths:
+
+   ```sh
+   export AUTOLITH_MANAGEMENT_REPL_UNIX_SOCKET="$HOME/.local/state/autolith-mobile/rpc/gateway.sock"
+   export AUTOLITH_MANAGEMENT_REPL_TOKEN_FILE="$HOME/.local/state/autolith-mobile/management-token"
    export AUTOLITH_BRIDGE_TOKEN_FILE="$HOME/.local/state/autolith-mobile/token"
-   printf '%s\n' '{"operation":"rpc-handshake"}' | "$AUTOLITH_EXECUTABLE" mobile
    .build/release/autolith-bridge
    ```
 
-   Wait for `{"rpcProtocol":1}` before starting the companion. The handshake materializes a new Nix package's local Lisp images; first-use image construction can exceed the normal 60-second request timeout on a busy Mac.
-5. Run `tailscale serve --bg http://127.0.0.1:4318`. Use the HTTPS address it prints in the app. See [Tailscale Serve documentation](https://tailscale.com/docs/reference/tailscale-cli/serve).
+   Startup verifies the authenticated gateway connection. New sessions inherit the gateway's installed Autolith build and management settings, with an individual private socket. The companion saves their endpoint inventory next to its token so restarting the companion does not lose their live transcript access. Do not delete that inventory while sessions are running.
+5. Run `tailscale serve --bg http://127.0.0.1:4318`. Keep the existing HTTPS address and companion token in the phone app.
 
-The companion checks for idle sessions once a minute, even when the iOS app is closed.
-After 30 minutes of continuously observed inactivity it requests a guarded shutdown,
-preserving saved history for Resume. Set `AUTOLITH_IDLE_SESSION_TIMEOUT_SECONDS`
-to change the interval (minimum 60 seconds). Active turns, queued input, live jobs,
-paused sessions, and sessions with attached terminals are protected. Failed inventory
-checks and restarted processes reset the observation period. Older session processes
-without guarded shutdown support are left running until stopped or restarted normally.
+Live status and durable transcripts refresh through polling. This backend does not install token-streaming hooks or automatically stop idle sessions. Stop remains available explicitly in the app, and saved history remains available for Resume.
 
 The companion binds only `127.0.0.1:4318`. Tailscale Serve supplies private tailnet HTTPS; the companion additionally checks a bearer token. Anyone with both network access and the token can control sessions as the host user. Store provider credentials on the backend host. Rotate the companion token by replacing its file and restarting the companion, then updating the mobile client.
 
-Headers must authenticate within five seconds; authenticated request bodies have fifteen seconds. The bridge reserves separate pending-handshake and authenticated connection capacity. Requests have an overall 65-second deadline, including backend checkout and I/O. Transport failures cancel pending backend work, but a mutation already handed off may have executed. A client may half-close its completed HTTP request and read the response. Backend subprocess cleanup covers its process group, not descendants that deliberately detach. Full reply correlation, downstream mutation deduplication, and atomic idle revision/PID checks require backend protocol support.
+Headers must authenticate within five seconds; authenticated request bodies have fifteen seconds. The bridge reserves separate pending-handshake and authenticated connection capacity. Requests have an overall 65-second deadline, including backend checkout and I/O. Transport failures cancel pending backend work, but a mutation already handed off may have executed. A client may half-close its completed HTTP request and read the response.
 
 ### Run with Nix on macOS or Linux
 
@@ -58,12 +64,13 @@ The flake exports `autolith-bridge` as both a package and a command-line app, wi
 Enable Nix's `nix-command` and `flakes` features. Set up the backend and private token file as described above, then run:
 
 ```sh
-export AUTOLITH_EXECUTABLE=/absolute/path/to/autolith
+export AUTOLITH_MANAGEMENT_REPL_UNIX_SOCKET="$HOME/.local/state/autolith-mobile/rpc/gateway.sock"
+export AUTOLITH_MANAGEMENT_REPL_TOKEN_FILE="$HOME/.local/state/autolith-mobile/management-token"
 export AUTOLITH_BRIDGE_TOKEN_FILE="$HOME/.local/state/autolith-mobile/token"
 nix run github:chakanysystems/autolith-remote#autolith-bridge
 ```
 
-The bridge runs in the foreground. Run Tailscale Serve as described above to connect the mobile client. The backend, token, and optional APNs settings are supplied at runtime.
+The bridge runs in the foreground. Run Tailscale Serve as described above to connect the mobile client. The management gateway must already be running. Socket, token, and optional APNs settings are supplied at runtime.
 
 To install the bridge into your Nix profile:
 
@@ -76,7 +83,7 @@ From a local checkout, use `nix run .`, `nix build .`, or `nix flake check`. Lin
 
 `flake.lock` pins the build tools. `Package.swift` and `Package.resolved` pin Swift 5.10-compatible dependencies; `nix/dependencies` contains their fixed hashes and offline SwiftPM workspace metadata. When updating dependencies, resolve the package graph and regenerate that metadata with the pinned `swiftpm2nix`, then test both platforms.
 
-Other flakes can use `inputs.autolith-remote.packages.${system}.autolith-bridge`. The derivation in `nix/package.nix` can also be used with `pkgs.callPackage`. To start the installed bridge at login, use a per-user launchd agent on macOS or systemd user service on Linux, supplying absolute backend and token paths in its environment.
+Other flakes can use `inputs.autolith-remote.packages.${system}.autolith-bridge`. The derivation in `nix/package.nix` can also be used with `pkgs.callPackage`. To start the installed bridge at login, use a per-user launchd agent on macOS or systemd user service on Linux. Supply absolute socket and token paths in its environment.
 
 ## Sessions and permissions
 
@@ -105,17 +112,17 @@ swift test
 xcodebuild -project Autolith.xcodeproj -scheme Autolith -sdk iphonesimulator -configuration Debug -derivedDataPath /tmp/autolith-ipad-derived CODE_SIGNING_ALLOWED=NO build
 ```
 
-Run `./script/check` in the mobile-enabled Autolith backend checkout after installing its documented dependencies. Test Siri routing, notifications, and Live Activities on a compatible physical device with the companion running.
+The harness has no companion-specific changes. To run the transport integration test against a live management endpoint, set `AUTOLITH_TEST_MANAGEMENT_SOCKET` and `AUTOLITH_TEST_MANAGEMENT_TOKEN` when running `swift test`. Test Siri routing, notifications, and Live Activities on a compatible physical device with the companion running.
 
 ## Native controls
 
-- The model button above the transcript opens a searchable model picker grouped by provider. Choices and Lisp/command completions come from the running Mac session, including its registered tools.
+- The model button above the transcript opens a searchable model picker grouped by provider. For sessions created by this companion, choices and completions come from that session's management endpoint. Older sessions without a known management socket use the gateway's configured catalog; their durable history and ordinary controls remain available.
 - Enter a parenthesized Lisp expression to run it through Autolith's local input path. Results appear directly in the transcript. Incomplete forms are rejected with the draft preserved. Ordinary local Lisp runs in the active session; `lisp.*` operations retain their disposable-worker behavior.
 - Return sends or runs the current input. Shift-Return inserts a newline; Command-Return also sends. Tab accepts the first suggested completion, or tap a suggestion. Completion works at nested forms and avoids strings/comments. Lisp-only results remain local session context until the first prompt persists the conversation, matching the terminal's behavior.
 - Command-N starts a session, Command-comma opens Settings, and Command-R refreshes. The sidebar supports pull to refresh. The session menu opens the system share sheet for its loaded transcript.
 - Connection, initial history, model loading, mutations, session creation, and running work show contextual progress indicators. Searchable sheets, system materials, Dynamic Type, labeled status, and native sidebar disclosures follow Apple's [iPad guidance](https://developer.apple.com/design/human-interface-guidelines/designing-for-ipados).
 
-Older running Mac processes need Stop followed by Resume once to load the new model/completion and Lisp snapshot protocol. Updating the companion alone does not replace a running Lisp image.
+For full access to in-memory Lisp results and session-specific completions, stop and resume an older session through the companion once. Updating the companion does not replace an already running Lisp image.
 
 ## Live Activities
 

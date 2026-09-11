@@ -8,9 +8,6 @@ import BridgeCore
 
 // The listener accepts loopback only. Tailscale Serve owns remote HTTPS.
 let environment = ProcessInfo.processInfo.environment
-let executable = environment["AUTOLITH_EXECUTABLE"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".nix-profile/bin/autolith").path
-try BackendChild.prepareReaping()
-let backend = BackendPool(executable: executable)
 let transcripts = TranscriptService()
 guard let tokenPath = environment["AUTOLITH_BRIDGE_TOKEN_FILE"] else {
     fputs("Set AUTOLITH_BRIDGE_TOKEN_FILE to a private file containing a random token.\n", stderr); exit(64)
@@ -21,6 +18,24 @@ guard let tokenText = String(data: tokenData, encoding: .utf8) else {
 }
 let token = tokenText.trimmingCharacters(in: .whitespacesAndNewlines)
 guard token.utf8.count >= 32 else { fputs("Token must contain at least 32 random characters.\n", stderr); exit(64) }
+let home = FileManager.default.homeDirectoryForCurrentUser.path
+let stateHome = environment["XDG_STATE_HOME"] ?? home + "/.local/state"
+let configHome = environment["XDG_CONFIG_HOME"] ?? home + "/.config"
+let managementSocket = environment["AUTOLITH_MANAGEMENT_REPL_UNIX_SOCKET"] ?? stateHome + "/autolith/management/repl.sock"
+let managementToken = environment["AUTOLITH_MANAGEMENT_REPL_TOKEN_FILE"] ?? configHome + "/autolith/management-repl.token"
+func makeBackend() -> BackendPool {
+    do {
+        let backend = try BackendPool(socketPath: managementSocket, tokenPath: managementToken,
+                                      mappingFile: URL(fileURLWithPath: tokenPath).deletingLastPathComponent().appendingPathComponent("management-endpoints.json"))
+        try backend.checkConnection()
+        return backend
+    } catch {
+        fputs("Cannot start management RPC companion: \(error.localizedDescription)\n", stderr)
+        exit(69)
+    }
+}
+let backend = makeBackend()
+
 let queue = DispatchQueue(label: "autolith.bridge")
 let workers = DispatchQueue(label: "autolith.operations", attributes: .concurrent)
 let slots = DispatchSemaphore(value: 4)
@@ -52,18 +67,6 @@ let alertService = try AlertPushService(file: URL(fileURLWithPath: tokenPath).de
     return result
 }
 
-let idleTimeoutText = environment["AUTOLITH_IDLE_SESSION_TIMEOUT_SECONDS"] ?? "1800"
-guard let idleTimeout = Double(idleTimeoutText), idleTimeout.isFinite, idleTimeout >= 60 else {
-    fputs("AUTOLITH_IDLE_SESSION_TIMEOUT_SECONDS must be at least 60.\n", stderr); exit(64)
-}
-let idleSessions = IdleSessionService(timeout: idleTimeout) { object in
-    let data = try execute(JSONSerialization.data(withJSONObject: object))
-    guard let reply = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-        throw BridgeError.invalid("Invalid cleanup response")
-    }
-    if let error = reply["error"] as? String { throw BridgeError.invalid(error) }
-    return reply
-}
 
 func execute(_ body: Data, context: BackendRequestContext = BackendRequestContext()) throws -> Data {
     try context.check()
@@ -74,9 +77,6 @@ func execute(_ body: Data, context: BackendRequestContext = BackendRequestContex
         return result
     }
     if let object = try JSONSerialization.jsonObject(with: body) as? [String: Any] {
-        if let operation = object["operation"] as? String,
-           ["tell", "resume", "message-send", "pause"].contains(operation),
-           let id = object["id"] as? String { idleSessions.activity(id) }
         if var result = try messageService.handle(object, request: request, beforeMutation: { try context.check() }) {
             if object["operation"] as? String == "message-send", let id = object["id"] as? String {
                 do {
@@ -126,7 +126,7 @@ func execute(_ body: Data, context: BackendRequestContext = BackendRequestContex
             return try JSONSerialization.data(withJSONObject: WorkspaceBrowser.listing(path: object["path"] as? String))
         }
         if object["operation"] as? String == "capabilities" {
-            return try JSONSerialization.data(withJSONObject: ["pushEnabled": pushService.enabled, "eventStreamVersion": 1, "transcriptSyncVersion": 1])
+            return try JSONSerialization.data(withJSONObject: ["pushEnabled": pushService.enabled, "eventStreamVersion": 1, "transcriptSyncVersion": 1, "backendTransport": "management-rpc", "idleShutdownSupported": false])
         }
         if object["operation"] as? String == "activity-register" {
             try pushService.register(object, beforeMutation: { try context.check() })
@@ -140,7 +140,7 @@ func executeAutolith(_ body: Data, context: BackendRequestContext = BackendReque
     try context.check()
     guard let object = try JSONSerialization.jsonObject(with: body) as? [String: Any],
           let operation = object["operation"] as? String,
-          ["list", "create", "resume", "transcript", "tell", "pause", "kill", "stop-idle", "delete", "catalog"].contains(operation) else { throw BridgeError.invalid("Unsupported operation") }
+          ["list", "create", "resume", "transcript", "tell", "pause", "kill", "delete", "catalog"].contains(operation) else { throw BridgeError.invalid("Unsupported operation") }
     return try backend.call(JSONSerialization.data(withJSONObject: object), context: context)
 }
 
@@ -184,7 +184,7 @@ final class Client {
                         }
                         guard streamSlots.wait(timeout: .now()) == .success else { self.fail(503, "Too many event streams"); return }
                         self.finished = true
-                        let stream = EventStream(connection: self.connection, queue: queue, executable: executable) { streamSlots.signal() }
+                        let stream = EventStream(connection: self.connection, queue: queue, backend: backend) { streamSlots.signal() }
                         self.stream = stream
                         let remainder = Data(self.data.dropFirst(upgrade.consumedBytes))
                         self.data.removeAll()
