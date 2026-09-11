@@ -112,7 +112,7 @@ struct DraftAutolithMessageIntent {
         guard scheduledDate == nil else { throw NSError(domain: "Autolith", code: 1, userInfo: [NSLocalizedDescriptionKey: "Schedule the message when sending it, not when opening its draft."]) }
         let value = try SiriMessaging.text(content: content, subject: subject, attachments: attachments, audio: audioMessage, locations: locations, links: links, allowEmpty: true)
         let (connection, session) = try await SiriMessaging.session(destination: destination)
-        SiriNavigationState.shared.draft = (session.id, value)
+        SiriNavigationState.shared.draft = (connection.host, session.id, value)
         SiriConversationMemory.remember(id: session.id, host: connection.host)
         return .result()
     }

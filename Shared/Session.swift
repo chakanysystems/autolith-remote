@@ -46,6 +46,12 @@ public struct WorkSummary: Codable, Hashable, Sendable {
     public let queued: Int
     public let items: [Item]
 
+    /// Wire counters are untrusted. Clamp negatives and saturate instead of trapping.
+    static func addingCounter(_ total: Int, _ value: Int) -> Int {
+        let (sum, overflow) = max(0, total).addingReportingOverflow(max(0, value))
+        return overflow ? Int.max : sum
+    }
+
     public var finished: WorkSummary {
         WorkSummary(sessions: 0, tasks: 0, queued: 0,
                     items: items.map { Item(id: $0.id, title: $0.title, state: "idle") })
@@ -61,8 +67,8 @@ public struct WorkSummary: Codable, Hashable, Sendable {
             return left == right ? $0.id < $1.id : left > right
         }
         return WorkSummary(sessions: working.count,
-                           tasks: working.reduce(0) { $0 + max(0, $1.jobs) },
-                           queued: working.reduce(0) { $0 + max(0, $1.queued) },
+                           tasks: working.reduce(0) { addingCounter($0, $1.jobs) },
+                           queued: working.reduce(0) { addingCounter($0, $1.queued) },
                            items: working.prefix(3).map { Item(id: $0.id, title: String(decoding: $0.title.utf8.prefix(160), as: UTF8.self), state: $0.state) })
     }
 }

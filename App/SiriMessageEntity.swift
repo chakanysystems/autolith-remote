@@ -42,7 +42,7 @@ struct AutolithMessageEntity: IndexedEntity, Transferable {
         messageType = .unspecified
         author = AutolithAgentEntity(host: conversation.host, isMe: event.role == "user", sessionID: conversation.sessionID, title: conversation.displayName)
         isRead = event.hasBeenRead
-        attributes = event.deliveryState == "queued" ? [.queued] : event.deliveryState == "uncertain" ? [.deliveryUncertain] : []
+        attributes = event.isDeliveryPending ? [.queued] : event.deliveryState == "uncertain" ? [.deliveryUncertain] : event.deliveryState == "failed" ? [.deliveryFailed] : []
         self.conversation = conversation
         self.date = date
         body = AttributedString(event.text)
@@ -61,8 +61,8 @@ enum AutolithMessageType: String { case unspecified
 
 @available(iOS 27.0, macOS 27.0, *)
 @AppEnum(schema: .messages.messageAttribute)
-enum AutolithMessageAttribute: String { case favorited, queued, deliveryUncertain
-    static let caseDisplayRepresentations: [Self: DisplayRepresentation] = [.favorited: "Favorited", .queued: "Queued", .deliveryUncertain: "Delivery uncertain"]
+enum AutolithMessageAttribute: String { case favorited, queued, deliveryUncertain, deliveryFailed
+    static let caseDisplayRepresentations: [Self: DisplayRepresentation] = [.favorited: "Favorited", .queued: "Queued", .deliveryUncertain: "Delivery uncertain", .deliveryFailed: "Not delivered"]
 }
 
 @available(iOS 27.0, macOS 27.0, *)

@@ -5,15 +5,10 @@ import Darwin
 import Glibc
 #endif
 
-/// A durable handoff queue. A crashed handoff is uncertain and is never replayed automatically.
-/// Only queued, dispatching, uncertain, and unknown states count against the 10,000-work limit.
-/// Keep at most 1,000 sent/unsent payloads, for at most 30 days after completion. Legacy
-/// terminal records use creation time. Retire payloads on startup and queue transitions.
-/// Retired UUIDs are durable, permanent tombstones: duplicate rejection has no expiry.
-/// UUIDv4 requests carry no trustworthy age, so deleting their tombstones would allow replay.
-/// The small identity ledger grows with lifetime traffic; full payload retention is bounded.
-/// Transcript read overrides persist until explicitly changed. Retiring an outbox payload
-/// removes only its own read override, because that event can no longer be fetched.
+/// Durable handoffs with bounded payload/metadata storage and permanent replay tombstones.
+/// Admission stops at 24 MiB, reserving 8 MiB for transitions of already admitted work.
+/// Once the lifetime identity ledger fills the admission budget, new work is rejected.
+/// Possibly sent handoffs are never retried automatically.
 public final class MessageOutbox: @unchecked Sendable {
     public struct Message: Codable, Sendable, Equatable {
         public let id: String
@@ -21,9 +16,10 @@ public final class MessageOutbox: @unchecked Sendable {
         public let workspace: String
         public var text: String
         public let created: Double
-        public let dispatchAt: Double
+        public var dispatchAt: Double
         public var state: String
         public var completedAt: Double?
+        public var attempts: Int? = nil
     }
     private struct Storage: Codable, Equatable {
         var messages: [String: Message] = [:]
@@ -42,45 +38,50 @@ public final class MessageOutbox: @unchecked Sendable {
     static let pendingLimit = 10_000
     static let terminalLimit = 1_000
     static let terminalLifetime: Double = 30 * 24 * 60 * 60
+    static let byteLimit = 32 * 1024 * 1024
+    static let admissionByteLimit = 24 * 1024 * 1024
+    static let readLimit = 100_000
 
     private static func isTerminal(_ message: Message) -> Bool {
         message.state == "sent" || message.state == "unsent"
     }
-    private let lock = NSLock()
+    private let lock = NSRecursiveLock()
     private let file: URL
     private var storage: Storage
-    private let lockFile: Int32
+    private var lockFile: Int32
+    var persist: (Data, URL) throws -> Void = { try DurableJSONFile.write($0, to: $1) }
+    // Lowered by focused capacity tests; production uses the fixed admission budget.
+    var admissionByteBudget = MessageOutbox.admissionByteLimit
+    private var needsDurabilityConfirmation = false
 
     public init(file: URL, now: Double = Date().timeIntervalSince1970) throws {
         self.file = file
-        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let descriptor = open(file.path + ".lock", O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
-        guard descriptor >= 0 else { throw BridgeError.invalid("Could not open the outbox lock.") }
-        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
-            close(descriptor)
-            throw BridgeError.invalid("Another companion owns the message outbox.")
-        }
+        let descriptor = try DurableJSONFile.openLock(at: URL(fileURLWithPath: file.path + ".lock"))
         lockFile = descriptor
         storage = Storage()
         do {
-            if FileManager.default.fileExists(atPath: file.path) {
-                storage = try JSONDecoder().decode(Storage.self, from: Data(contentsOf: file))
+            if let data = try DurableJSONFile.read(at: file, maximumBytes: Self.byteLimit) {
+                storage = try JSONDecoder().decode(Storage.self, from: data)
             }
-            for id in storage.messages.keys where storage.messages[id]?.state == "dispatching" {
-                storage.messages[id]?.state = "uncertain"
-            }
+            try recoverInFlight(now: now)
             try retireTerminalMessages(now: now)
             try save()
-        } catch { close(descriptor); throw error }
+        } catch { close(descriptor); lockFile = -1; throw error }
     }
 
-    deinit { close(lockFile) }
+    deinit { if lockFile >= 0 { close(lockFile) } }
 
     private func save() throws {
-        let directory = file.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        try JSONEncoder().encode(storage).write(to: file, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        let data = try JSONEncoder().encode(storage)
+        guard data.count <= Self.byteLimit else { throw BridgeError.invalid("Outbox byte budget exhausted.") }
+        try persist(data, file)
+    }
+
+    private func checkAdmission() throws {
+        guard storage.read.count <= Self.readLimit,
+              try JSONEncoder().encode(storage).count <= admissionByteBudget else {
+            throw BridgeError.invalid("Outbox storage is full. Abandon unresolved work or retire completed payloads before adding more. Lifetime replay identities cannot be removed.")
+        }
     }
 
     private func retireTerminalMessages(now: Double) throws {
@@ -100,17 +101,51 @@ public final class MessageOutbox: @unchecked Sendable {
             storage.read.removeValue(forKey: message.sessionID + "#outbox-" + message.id)
         }
     }
+    /// Check a request deadline after acquiring the mutation lock, before changing state.
+    public func withMutationPrecondition<T>(_ check: () throws -> Void, _ body: () throws -> T) throws -> T {
+        lock.lock(); defer { lock.unlock() }
+        try check()
+        return try body()
+    }
     private func change<T>(_ operation: () throws -> T) throws -> T {
         lock.lock(); defer { lock.unlock() }
+        if needsDurabilityConfirmation {
+            try save()
+            needsDurabilityConfirmation = false
+        }
         let before = storage
         do { let result = try operation(); if storage != before { try save() }; return result }
+        catch let error as DurableJSONFile.CommitError {
+            needsDurabilityConfirmation = true
+            throw error
+        }
         catch { storage = before; throw error }
     }
 
+    /// Call only when no dispatcher is active, e.g. startup or between serial dispatch ticks.
+    /// Recover transitions whose failure could not be recorded during the previous tick.
+    public func recoverInFlight(now: Double = Date().timeIntervalSince1970) throws {
+        try change {
+            guard now.isFinite else { throw BridgeError.invalid("Invalid outbox time.") }
+            for id in storage.messages.keys {
+                if storage.messages[id]?.state == "preparing" {
+                    var message = storage.messages[id]!
+                    let attempts = min(4, max(0, message.attempts ?? 0)) + 1
+                    message.attempts = attempts
+                    message.state = attempts < 5 ? "queued" : "failed"
+                    message.dispatchAt = now + min(300, 15 * pow(2, Double(attempts)))
+                    storage.messages[id] = message
+                } else if storage.messages[id]?.state == "dispatching" {
+                    storage.messages[id]?.state = "uncertain"
+                }
+            }
+        }
+    }
     public func enqueue(id: String, sessionID: String, workspace: String, text: String, now: Double = Date().timeIntervalSince1970, scheduled: Double? = nil) throws -> Message {
         try change {
             guard let requestID = UUID(uuidString: id), now.isFinite,
-                  !sessionID.isEmpty, workspace.hasPrefix("/"),
+                  !sessionID.isEmpty, sessionID.utf8.count <= 4096,
+                  workspace.hasPrefix("/"), workspace.utf8.count <= 4096,
                   !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, text.utf8.count <= 100_000 else {
                 throw BridgeError.invalid("Invalid message, workspace, or delivery date.")
             }
@@ -134,6 +169,7 @@ public final class MessageOutbox: @unchecked Sendable {
                                 dispatchAt: max(now + 15, scheduled ?? now), state: "queued")
             storage.messages[id] = value
             try retireTerminalMessages(now: now)
+            try checkAdmission()
             return value
         }
     }
@@ -145,7 +181,7 @@ public final class MessageOutbox: @unchecked Sendable {
 
     public func pending(sessionID: String) -> [Message] {
         lock.lock(); defer { lock.unlock() }
-        return storage.messages.values.filter { $0.sessionID == sessionID && ["queued", "dispatching", "uncertain"].contains($0.state) }.sorted { $0.created < $1.created }
+        return storage.messages.values.filter { $0.sessionID == sessionID && !Self.isTerminal($0) }.sorted { $0.created < $1.created }
     }
 
     public func edit(_ id: String, text: String, now: Double = Date().timeIntervalSince1970) throws -> Message {
@@ -155,6 +191,7 @@ public final class MessageOutbox: @unchecked Sendable {
             }
             guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, text.utf8.count <= 100_000 else { throw BridgeError.invalid("Provide a nonempty message under 100 KB.") }
             message.text = text; storage.messages[id] = message
+            try checkAdmission()
             return message
         }
     }
@@ -172,11 +209,16 @@ public final class MessageOutbox: @unchecked Sendable {
     }
 
     public func setRead(_ id: String, value: Bool) throws {
-        try change { storage.read[id] = value }
+        try setRead([id], value: value)
     }
 
     public func setRead(_ ids: [String], value: Bool) throws {
-        try change { for id in ids { storage.read[id] = value } }
+        try change {
+            guard ids.count <= 100, ids.allSatisfy({ $0.utf8.count <= 8192 }) else { throw BridgeError.invalid("Read receipt metadata exceeds its budget.") }
+            let addsMetadata = ids.contains { storage.read[$0] == nil }
+            for id in ids { storage.read[id] = value }
+            if addsMetadata { try checkAdmission() }
+        }
     }
 
     /// Validate and record an outbox receipt under the same lock as payload retirement.
@@ -185,7 +227,10 @@ public final class MessageOutbox: @unchecked Sendable {
             guard let message = storage.messages[id], message.sessionID == sessionID, message.state != "unsent" else {
                 throw BridgeError.invalid("Message no longer exists.")
             }
-            storage.read[sessionID + "#outbox-" + id] = value
+            let key = sessionID + "#outbox-" + id
+            let addsMetadata = storage.read[key] == nil
+            storage.read[key] = value
+            if addsMetadata { try checkAdmission() }
         }
     }
 
@@ -195,13 +240,61 @@ public final class MessageOutbox: @unchecked Sendable {
         return storage.read[id] ?? (role != "assistant")
     }
 
-    public func claim(now: Double = Date().timeIntervalSince1970) throws -> Message? {
+    public func claim(now: Double = Date().timeIntervalSince1970, preparing: Bool = false) throws -> Message? {
         try change {
             try retireTerminalMessages(now: now)
             guard var message = storage.messages.values.filter({ $0.state == "queued" && $0.dispatchAt <= now }).sorted(by: { $0.dispatchAt < $1.dispatchAt }).first else { return nil }
-            message.state = "dispatching"; storage.messages[message.id] = message
+            message.state = preparing ? "preparing" : "dispatching"; storage.messages[message.id] = message
             return message
         }
+    }
+
+    /// Persist the ambiguity boundary immediately before calling tell.
+    public func beginHandoff(_ id: String) throws {
+        try change {
+            guard storage.messages[id]?.state == "preparing" else { throw BridgeError.invalid("Message is not preparing.") }
+            storage.messages[id]?.state = "dispatching"
+        }
+    }
+
+    public func preparationFailed(_ id: String, now: Double = Date().timeIntervalSince1970) throws {
+        try change {
+            guard now.isFinite, var message = storage.messages[id], message.state == "preparing" else { throw BridgeError.invalid("Message is not preparing.") }
+            let attempts = min(4, max(0, message.attempts ?? 0)) + 1
+            message.attempts = attempts
+            message.state = attempts < 5 ? "queued" : "failed"
+            message.dispatchAt = now + min(300, 15 * pow(2, Double(attempts)))
+            storage.messages[id] = message
+        }
+    }
+
+    /// Explicit retry is only safe after a known failure before tell was invoked.
+    public func retry(_ id: String, now: Double = Date().timeIntervalSince1970) throws -> Message {
+        try change {
+            guard now.isFinite, var message = storage.messages[id], message.state == "failed" else { throw BridgeError.invalid("Only a known pre-handoff failure can be retried.") }
+            message.state = "queued"; message.attempts = 0; message.dispatchAt = now + 30
+            storage.messages[id] = message
+            return message
+        }
+    }
+
+    /// Forget a payload without authorizing replay of its identity or undoing delivery.
+    public func abandon(_ id: String) throws {
+        try change {
+            guard let uuid = UUID(uuidString: id) else { throw BridgeError.invalid("Invalid request ID.") }
+            if storage.retiredIDs.contains(uuid) { return }
+            guard let message = storage.messages[id], !["preparing", "dispatching"].contains(message.state) else { throw BridgeError.invalid("Cannot abandon an active handoff.") }
+            storage.retiredIDs.insert(uuid)
+            storage.messages.removeValue(forKey: id)
+            storage.read.removeValue(forKey: message.sessionID + "#outbox-" + id)
+        }
+    }
+
+    public func receipt(_ id: String) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        guard let uuid = UUID(uuidString: id) else { return nil }
+        if storage.retiredIDs.contains(uuid) { return "retired" }
+        return (storage.messages[id] ?? storage.messages.values.first { UUID(uuidString: $0.id) == uuid })?.state
     }
 
     public func finish(_ id: String, delivered: Bool, now: Double = Date().timeIntervalSince1970) throws {

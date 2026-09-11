@@ -126,7 +126,7 @@ struct OpenAutolithSessionIntent: OpenIntent {
         let connection = try SiriSessionService.connected()
         SiriInvocation.record("Open session")
         try SiriSessionService.requireHost(target.host, connection: connection)
-        SiriNavigationState.shared.sessionID = target.sessionID
+        SiriNavigationState.shared.sessionID = (target.host, target.sessionID)
         return .result()
     }
 }

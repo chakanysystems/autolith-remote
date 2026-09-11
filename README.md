@@ -22,7 +22,7 @@ The Swift companion requires a mobile-enabled Autolith build with `autolith mobi
 
 1. Build the companion with `swift build -c release`.
 2. Build a mobile-enabled Autolith checkout with its documented bootstrap or Nix build.
-3. Generate a random token of at least 32 characters in a file owned by you with mode 0600, inside a private directory.
+3. Generate a random token of at least 32 characters in an owned mode-0600 regular file, inside an owned mode-0700 directory. Credential files and their immediate directory must not grant access through ACLs. Ancestors must be owned by you or root and not writable by other users, except trusted sticky directories.
 4. Set the executable and token paths, verify the handshake, and start the companion:
 
    ```sh
@@ -44,6 +44,8 @@ checks and restarted processes reset the observation period. Older session proce
 without guarded shutdown support are left running until stopped or restarted normally.
 
 The companion binds only `127.0.0.1:4318`. Tailscale Serve supplies private tailnet HTTPS; the companion additionally checks a bearer token. Anyone with both network access and the token can control sessions as the Mac user. Autolith endpoint tokens and provider credentials remain on the Mac. Rotate the companion token by replacing its file and restarting the companion, then updating the iPad.
+
+Headers must authenticate within five seconds; authenticated request bodies have fifteen seconds. The bridge reserves separate pending-handshake and authenticated connection capacity. Requests have an overall 65-second deadline, including backend checkout and I/O. Disconnects cancel pending backend work, but a mutation already handed off may have executed. Backend subprocess cleanup covers its process group, not descendants that deliberately detach. Full reply correlation, downstream mutation deduplication, and atomic idle revision/PID checks require backend protocol support.
 
 ### Run with Nix on macOS
 
@@ -137,6 +139,9 @@ When you have an Apple Developer account with push capability for this bundle ID
 
 The implementation uses Apple's [Live Activities guidance](https://developer.apple.com/design/human-interface-guidelines/live-activities) and [ActivityKit push protocol](https://developer.apple.com/documentation/activitykit/starting-and-updating-live-activities-with-activitykit-push-notifications). Apple controls delivery frequency and background execution.
 
+## Validation
+
+Run `bash ci_scripts/validate.sh all` with Xcode 27.0 and its iOS 27.0 Simulator SDK. Use `swiftpm` or `simulator` instead of `all` to run one check. The validation workflow uses fresh build directories for the complete SwiftPM test suite and an unsigned Release simulator build of the app with its embedded extension. Device signing and APNs delivery require separate device validation.
 ## App icon
 
 `App/AppIcon.icon` is the editable Icon Composer document. It uses the exact six-row Cosmic FIGlet startup mark from Autolith's `src/startup/main.lisp` and the terminal's lime-to-green row colors, without a surrounding glass pane. The lettering is vector outlines, so no runtime font is required. Xcode compiles this layered document as `AppIcon` for iPadOS and Mac Catalyst, including system dark and tinted appearances.
@@ -155,9 +160,13 @@ On iOS 27 the app also adopts the five messaging action schemas: send, draft, ed
 
 Schema sends and notification replies enter a durable Mac outbox with a minimum 15-second delay. Siri can edit or unsend that message before its dispatch deadline, or schedule it for a later date. Draft opens the conversation with editable text. Messaging accepts text prompts; separate subjects, attachments, audio, and locations produce an explicit unsupported-content error. After dispatch starts, edit and unsend fail because executing tools cannot be undone. Requests resume stopped conversations using the original session ID. Unconfirmed delivery is shown in the conversation and is never automatically retried.
 
-The companion stores outbox and read state privately beside its token under `messages/outbox.json`, with one exclusive process owner and atomic writes. Queued messages survive restart; an interrupted handoff becomes uncertain. Up to 10,000 unresolved messages can wait in the outbox. Completed payloads are kept for at most 30 days, with a limit of 1,000. Retired request IDs are kept in a permanent, growing ID list to reject duplicate sends after their payloads expire. Keep the companion running for scheduled messages to dispatch.
+The companion stores outbox and read state privately beside its token under `messages/outbox.json`, with one exclusive process owner, synchronized atomic replacement, and crash recovery. Dispatch persists `preparing` before inventory/resume and `dispatching` immediately before sending. Known pre-handoff failures retry after 30, 60, 120, and 240 seconds, then become `failed`. An interrupted or unconfirmed handoff becomes `uncertain` and is never automatically retried. Use Retry for failed delivery or Abandon to remove an unresolved payload while retaining its request-ID tombstone. `message-receipt` queries a request UUID; `message-retry` and `message-abandon` take a session `id` and outbox `eventID`.
+
+Up to 10,000 unresolved messages can wait. Completed payloads are kept for at most 30 days, with a limit of 1,000. Permanent retired request IDs prevent duplicate sends after payload expiry. New admissions and metadata are limited to 24 MiB of serialized state, reserving space for transitions up to a 32 MiB hard limit. A full ledger rejects new work instead of forgetting IDs. Keep the companion running for scheduled messages to dispatch.
 
 New assistant messages start unread. Viewing a message in an active app window, opening its notification, or using a read shortcut records a receipt on the Mac. Read state is shared by devices connected to that companion. Index failures after a confirmed message action are recorded for repair; they do not change the action result. The app requests a current APNs token on each enabled launch and retries failed registration with bounded delays. Equivalent HTTPS address spellings use one host identity.
+
+Changing connections first probes the candidate credentials. Pending callbacks and cached writes are scoped to the captured connection generation. Notification revocation on the old Mac is best effort when it is unreachable; APNs delivery is not exactly once. Local completion notifications provide a fallback. HTTP response accumulation is bounded to 8 MiB for transcripts/message batches, 2 MiB for lists/catalogs/browsing, and 256 KiB for other operations.
 
 Say “Ask Autolith a question” or “Start a task in Autolith”, then dictate your request. In Settings → Siri → Workspaces and nicknames, choose a default Mac folder and add spoken nicknames such as “backend” or “iOS app”. Defaults and nicknames are scoped to the connected Mac. Siri can also resolve these names in the existing “Ask Autolith in [workspace]” phrase.
 

@@ -3,6 +3,10 @@ import SwiftUI
 struct ConversationEventView: View {
     let event: Event
     let presentation: EventPresentation?
+    var retryMessage: (() -> Void)? = nil
+    var abandonMessage: (() -> Void)? = nil
+    var controlsEnabled = true
+    @State private var confirmingAbandon = false
     @State private var expanded = false
     @State private var thinkingVisible = true
 
@@ -34,8 +38,22 @@ struct ConversationEventView: View {
                 Text("Delivery unconfirmed. Check the conversation before sending again.").font(.caption).foregroundStyle(.orange)
             } else if event.deliveryState == "queued", let dispatchAt = event.dispatchAt {
                 Text("Queued for \(Date(timeIntervalSince1970: dispatchAt), format: .dateTime.hour().minute().second())").font(.caption).foregroundStyle(.secondary)
+            } else if event.deliveryState == "failed" {
+                Text("Not delivered. Preparation failed after repeated attempts.").font(.caption).foregroundStyle(.orange)
+            } else if event.deliveryState == "preparing" {
+                ProgressView("Preparing to send…").font(.caption)
             } else if event.deliveryState == "dispatching" {
                 ProgressView("Sending…").font(.caption)
+            }
+            if event.canRetryDelivery || event.canAbandonDelivery {
+                HStack {
+                    if event.canRetryDelivery, let retryMessage {
+                        Button("Retry delivery", action: retryMessage)
+                    }
+                    if event.canAbandonDelivery, abandonMessage != nil {
+                        Button("Abandon message", role: .destructive) { confirmingAbandon = true }
+                    }
+                }.font(.caption).disabled(!controlsEnabled)
             }
 
             if event.activityKind == .thinking {
@@ -67,6 +85,14 @@ struct ConversationEventView: View {
             if event.activityKind != nil {
                 RoundedRectangle(cornerRadius: 2).fill(tint.opacity(0.5)).frame(width: 2).padding(.vertical, 12)
             }
+        }
+        .confirmationDialog("Abandon this message?", isPresented: $confirmingAbandon, titleVisibility: .visible) {
+            Button("Abandon message", role: .destructive) { abandonMessage?() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(event.deliveryState == "uncertain"
+                 ? "Check the conversation first. Abandoning removes the pending payload and retains its receipt; it cannot undo a message already sent."
+                 : "Remove the pending payload and retain its receipt to prevent duplicate delivery.")
         }
     }
 

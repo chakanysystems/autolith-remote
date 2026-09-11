@@ -1,5 +1,10 @@
 import XCTest
 @testable import BridgeCore
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 final class MessageOutboxTests: XCTestCase {
     private func fixture(_ body: (URL) throws -> Void) throws {
@@ -89,9 +94,9 @@ final class MessageOutboxTests: XCTestCase {
     }
 
     private func seed(_ messages: [MessageOutbox.Message], read: [String: Bool] = [:], file: URL) throws {
-        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try DurableJSONFile.prepareDirectory(file.deletingLastPathComponent())
         let value = Seed(messages: Dictionary(uniqueKeysWithValues: messages.map { ($0.id, $0) }), read: read)
-        try JSONEncoder().encode(value).write(to: file)
+        try DurableJSONFile.write(JSONEncoder().encode(value), to: file)
     }
 
     private func record(state: String, created: Double = 100, completedAt: Double? = nil,
@@ -243,6 +248,228 @@ final class MessageOutboxTests: XCTestCase {
             XCTAssertThrowsError(try store.setMessageRead(id, sessionID: "session", value: true))
             _ = try store.claim(now: 101 + MessageOutbox.terminalLifetime)
             XCTAssertThrowsError(try store.setMessageRead(id, sessionID: "session", value: false))
+        }
+    }
+    func testPreparationRecoveryBackoffAndExplicitAbandonment() throws {
+        try fixture { file in
+            var store: MessageOutbox? = try MessageOutbox(file: file, now: 100)
+            let id = UUID().uuidString
+            _ = try store!.enqueue(id: id, sessionID: "s", workspace: "/w", text: "q", now: 100)
+            _ = try store!.claim(now: 115, preparing: true)
+            store = nil
+            store = try MessageOutbox(file: file, now: 200)
+            XCTAssertEqual(store!.message(id)?.state, "queued")
+            XCTAssertNil(try store!.claim(now: 229, preparing: true))
+            var time = 230.0
+            XCTAssertEqual(store!.message(id)?.attempts, 1)
+            for attempt in 2...5 {
+                XCTAssertEqual(try store!.claim(now: time, preparing: true)?.id, id)
+                try store!.preparationFailed(id, now: time)
+                XCTAssertEqual(store!.message(id)?.attempts, attempt)
+                XCTAssertNil(try store!.claim(now: time + 1, preparing: true))
+                time = store!.message(id)!.dispatchAt
+            }
+            XCTAssertEqual(store!.message(id)?.state, "failed")
+            XCTAssertNil(try store!.claim(now: time + 10000, preparing: true))
+            _ = try store!.retry(id, now: time)
+            _ = try store!.claim(now: time + 30, preparing: true)
+            XCTAssertThrowsError(try store!.abandon(id))
+            try store!.beginHandoff(id)
+            try store!.finish(id, delivered: false, now: time + 30)
+            XCTAssertThrowsError(try store!.retry(id))
+            try store!.abandon(id)
+            try store!.abandon(id)
+            store = nil
+            let restored = try MessageOutbox(file: file, now: time + 31)
+            XCTAssertEqual(restored.receipt(id), "retired")
+            XCTAssertNil(restored.message(id))
+            XCTAssertThrowsError(try restored.enqueue(id: id.lowercased(), sessionID: "s", workspace: "/w", text: "q"))
+        }
+    }
+
+    func testPersistenceFailureOnEitherSideOfRenameKeepsMemoryConsistent() throws {
+        for stage in [DurableJSONFile.Stage.temporaryCreated, .written, .fileSynced, .renamed, .directorySynced] {
+            try fixture { file in
+                var store: MessageOutbox? = try MessageOutbox(file: file, now: 100)
+                let id = UUID().uuidString
+                store!.persist = { data, url in
+                    try DurableJSONFile.write(data, to: url) { current in
+                        if current == stage { throw BridgeError.invalid("Injected failure") }
+                    }
+                }
+                XCTAssertThrowsError(try store!.enqueue(id: id, sessionID: "s", workspace: "/w", text: "q", now: 100))
+                let visible = store!.message(id)
+                XCTAssertEqual(visible != nil, stage == .renamed || stage == .directorySynced)
+                store = nil
+                let restored = try MessageOutbox(file: file, now: 100)
+                XCTAssertEqual(restored.message(id), visible)
+                let files = try FileManager.default.contentsOfDirectory(atPath: file.deletingLastPathComponent().path)
+                XCTAssertEqual(Set(files), ["outbox.json", "outbox.json.lock"])
+            }
+        }
+    }
+
+    func testAggregateBudgetBackpressureLeavesTransitionHeadroom() throws {
+        try fixture { file in
+            let records = (0..<251).map { _ -> MessageOutbox.Message in
+                var value = record(state: "queued")
+                value.text = String(repeating: "x", count: 100_000)
+                return value
+            }
+            try seed(records, file: file)
+            let store = try MessageOutbox(file: file, now: 100)
+            XCTAssertThrowsError(try store.enqueue(id: UUID().uuidString, sessionID: "s", workspace: "/w", text: String(repeating: "y", count: 100_000), now: 100))
+            let message = try XCTUnwrap(store.claim(now: 115, preparing: true))
+            try store.beginHandoff(message.id)
+            try store.finish(message.id, delivered: false, now: 116)
+            try store.abandon(message.id)
+            XCTAssertEqual(store.receipt(message.id), "retired")
+            XCTAssertLessThan(try Data(contentsOf: file).count, MessageOutbox.byteLimit)
+            XCTAssertThrowsError(try store.setRead(String(repeating: "k", count: 8193), value: true))
+            XCTAssertThrowsError(try store.enqueue(id: UUID().uuidString, sessionID: String(repeating: "s", count: 4097), workspace: "/w", text: "q"))
+        }
+    }
+
+    func testRejectsUnsafeStateDirectoryFileAndLock() throws {
+        try fixture { file in
+            let directory = file.deletingLastPathComponent()
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
+            XCTAssertThrowsError(try MessageOutbox(file: file))
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+            let target = directory.appendingPathComponent("target")
+            try Data("{}".utf8).write(to: target)
+            try FileManager.default.createSymbolicLink(at: file, withDestinationURL: target)
+            XCTAssertThrowsError(try MessageOutbox(file: file))
+            try FileManager.default.removeItem(at: file)
+            let lock = URL(fileURLWithPath: file.path + ".lock")
+            try? FileManager.default.removeItem(at: lock)
+            try FileManager.default.createSymbolicLink(at: lock, withDestinationURL: target)
+            XCTAssertThrowsError(try MessageOutbox(file: file))
+            XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "{}")
+        }
+    }
+    func testTemporaryPermissionsPrecedePayloadAndReplacement() throws {
+        try fixture { file in
+            let payload = Data("private-payload".utf8)
+            try DurableJSONFile.write(payload, to: file) { stage in
+                if stage == .temporaryCreated {
+                    let temporary = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: file.deletingLastPathComponent(), includingPropertiesForKeys: nil).first)
+                    let attributes = try FileManager.default.attributesOfItem(atPath: temporary.path)
+                    XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+                    XCTAssertEqual((attributes[.size] as? NSNumber)?.intValue, 0)
+                }
+            }
+            XCTAssertEqual(try DurableJSONFile.read(at: file, maximumBytes: payload.count), payload)
+            let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
+            XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+            XCTAssertThrowsError(try DurableJSONFile.read(at: file, maximumBytes: payload.count - 1))
+        }
+    }
+    func testLifetimeLedgerBackpressureNeverEvictsReplayIdentities() throws {
+        try fixture { file in
+            var store: MessageOutbox? = try MessageOutbox(file: file, now: 100)
+            store!.admissionByteBudget = 1200
+            var retired: [String] = []
+            var rejected = false
+            for _ in 0..<100 {
+                let id = UUID().uuidString
+                do { _ = try store!.enqueue(id: id, sessionID: "s", workspace: "/w", text: "q", now: 100) }
+                catch { rejected = true; break }
+                try store!.abandon(id)
+                retired.append(id)
+            }
+            XCTAssertTrue(rejected)
+            XCTAssertFalse(retired.isEmpty)
+            XCTAssertTrue(store!.pending(sessionID: "s").isEmpty)
+            store = nil
+            let restored = try MessageOutbox(file: file, now: 100)
+            restored.admissionByteBudget = 1200
+            for id in retired {
+                XCTAssertEqual(restored.receipt(id.lowercased()), "retired")
+                XCTAssertThrowsError(try restored.enqueue(id: id, sessionID: "s", workspace: "/w", text: "q", now: 100))
+            }
+            XCTAssertThrowsError(try restored.enqueue(id: UUID().uuidString, sessionID: "s", workspace: "/w", text: "q", now: 100))
+        }
+    }
+
+    func testReadMetadataCountBoundAllowsExistingOverrideChanges() throws {
+        try fixture { file in
+            let read = Dictionary(uniqueKeysWithValues: (0..<MessageOutbox.readLimit).map { ("s#\($0)", true) })
+            try seed([], read: read, file: file)
+            let store = try MessageOutbox(file: file, now: 100)
+            try store.setRead("s#0", value: false)
+            XCTAssertFalse(store.isRead("s#0", role: "user"))
+            XCTAssertThrowsError(try store.setRead("s#new", value: true))
+            XCTAssertFalse(store.isRead("s#new", role: "assistant"))
+        }
+    }
+    func testRestrictiveUmaskDoesNotProduceUnreadableStateOrLock() throws {
+        try fixture { file in
+            try DurableJSONFile.prepareDirectory(file.deletingLastPathComponent())
+            let previous = umask(0o777)
+            defer { umask(previous) }
+            let lock = try DurableJSONFile.openLock(at: URL(fileURLWithPath: file.path + ".lock"))
+            defer { close(lock) }
+            try DurableJSONFile.write(Data("private".utf8), to: file)
+            XCTAssertEqual(try DurableJSONFile.read(at: file, maximumBytes: 10), Data("private".utf8))
+            for path in [file.path, file.path + ".lock"] {
+                let attributes = try FileManager.default.attributesOfItem(atPath: path)
+                XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+            }
+        }
+    }
+
+    func testExistingUnsafeLockIsRejectedWithoutChangingPermissions() throws {
+        try fixture { file in
+            let lock = URL(fileURLWithPath: file.path + ".lock")
+            try DurableJSONFile.prepareDirectory(file.deletingLastPathComponent())
+            try Data().write(to: lock)
+            try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: lock.path)
+            XCTAssertThrowsError(try DurableJSONFile.openLock(at: lock))
+            let attributes = try FileManager.default.attributesOfItem(atPath: lock.path)
+            XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o644)
+        }
+    }
+    func testDirectorySynchronizationRetriesExistingAncestorEntriesAfterFailure() throws {
+        try fixture { file in
+            let directory = file.deletingLastPathComponent().appendingPathComponent("nested/state")
+            var first: [String] = []
+            XCTAssertThrowsError(try DurableJSONFile.prepareDirectory(directory) { descriptor in
+                var attributes = stat()
+                XCTAssertEqual(fstat(descriptor, &attributes), 0)
+                first.append("\(attributes.st_dev):\(attributes.st_ino)")
+                if first.count == 2 { throw BridgeError.invalid("Injected parent synchronization failure") }
+                XCTAssertEqual(fsync(descriptor), 0)
+            })
+            XCTAssertEqual(first.count, 2)
+            var retried: [String] = []
+            try DurableJSONFile.prepareDirectory(directory) { descriptor in
+                var attributes = stat()
+                XCTAssertEqual(fstat(descriptor, &attributes), 0)
+                retried.append("\(attributes.st_dev):\(attributes.st_ino)")
+                XCTAssertEqual(fsync(descriptor), 0)
+            }
+            XCTAssertEqual(Array(retried.prefix(first.count)), first)
+            XCTAssertGreaterThan(retried.count, first.count)
+        }
+    }
+
+    func testExistingReadOverridesUseTransitionReserveWhileNewMetadataIsRejected() throws {
+        try fixture { file in
+            let store = try MessageOutbox(file: file, now: 100)
+            let id = UUID().uuidString, second = UUID().uuidString
+            _ = try store.enqueue(id: id, sessionID: "s", workspace: "/w", text: "q", now: 100)
+            _ = try store.enqueue(id: second, sessionID: "s", workspace: "/w", text: "q", now: 100)
+            try store.setRead("s#1", value: true)
+            try store.setMessageRead(id, sessionID: "s", value: true)
+            store.admissionByteBudget = 1
+            try store.setRead("s#1", value: false)
+            try store.setMessageRead(id, sessionID: "s", value: false)
+            XCTAssertFalse(store.isRead("s#1", role: "user"))
+            XCTAssertFalse(store.isRead("s#outbox-" + id, role: "user"))
+            XCTAssertThrowsError(try store.setRead("s#2", value: true))
+            XCTAssertThrowsError(try store.setMessageRead(second, sessionID: "s", value: false))
+            XCTAssertTrue(store.isRead("s#outbox-" + second, role: "user"))
         }
     }
 }
