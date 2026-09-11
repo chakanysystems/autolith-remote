@@ -3,7 +3,7 @@ import Foundation
 
 struct AskAutolithIntent: AppIntent {
     static var title: LocalizedStringResource = "Ask Autolith"
-    static var description = IntentDescription("Send a question to a new session on your Mac in a known workspace. Work continues on the Mac after Siri finishes.")
+    static var description = IntentDescription("Send a question to a new session in a known workspace. Work continues in the background after this action finishes.")
     static var authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     @Parameter(title: "Workspace", requestValueDialog: "Which Mac workspace should I use?") var workspace: AutolithWorkspaceEntity?
     @Parameter(title: "Question") var question: String?

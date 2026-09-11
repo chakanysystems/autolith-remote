@@ -4,7 +4,7 @@ import Foundation
 @available(iOS 27.0, macOS 27.0, *)
 struct ReadLatestAutolithResponseIntent: AppIntent {
     static let title: LocalizedStringResource = "Read response to my last Autolith request"
-    static let description = IntentDescription("Fetch the current answer from the Mac for the conversation most recently sent to. Reports pending work instead of reading an older answer.")
+    static let description = IntentDescription("Fetch the current answer for the conversation most recently sent to. Reports pending work instead of reading an older answer.")
     static var authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
 
     @MainActor func perform() async throws -> some IntentResult & ReturnsValue<[AutolithMessageEntity]> & ProvidesDialog {

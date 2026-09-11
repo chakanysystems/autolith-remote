@@ -3,7 +3,7 @@ import Foundation
 
 struct FollowUpAutolithIntent: AppIntent {
     static var title: LocalizedStringResource = "Follow up with Autolith"
-    static var description = IntentDescription("Send another question to the same Autolith conversation. Defaults to the last conversation used through Siri, preserving its history.")
+    static var description = IntentDescription("Send another question to the same Autolith conversation. Defaults to the last conversation used through these actions, preserving its history.")
     static var authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     @Parameter(title: "Session") var session: AutolithSessionEntity?
     @Parameter(title: "Follow-up") var question: String?
