@@ -45,6 +45,31 @@ without guarded shutdown support are left running until stopped or restarted nor
 
 The companion binds only `127.0.0.1:4318`. Tailscale Serve supplies private tailnet HTTPS; the companion additionally checks a bearer token. Anyone with both network access and the token can control sessions as the Mac user. Autolith endpoint tokens and provider credentials remain on the Mac. Rotate the companion token by replacing its file and restarting the companion, then updating the iPad.
 
+### Run with Nix on macOS
+
+The flake exports `autolith-bridge` as both a package and a command-line app, with default aliases. It supports Apple Silicon (`aarch64-darwin`) and Intel (`x86_64-darwin`) on macOS 14 or later. The package builds the Swift bridge with Nix tools; Xcode is not needed for this build. The iOS app is built separately in Xcode.
+
+Enable Nix's `nix-command` and `flakes` features. Set up the backend and private token file as described above, then run:
+
+```sh
+export AUTOLITH_EXECUTABLE=/absolute/path/to/autolith
+export AUTOLITH_BRIDGE_TOKEN_FILE="$HOME/.local/state/autolith-mobile/token"
+nix run github:chakanysystems/autolith-remote#autolith-bridge
+```
+
+The bridge runs in the foreground. Run Tailscale Serve as described above to connect the mobile client. The backend, token, and optional APNs settings are supplied at runtime.
+
+To install the bridge into your Nix profile:
+
+```sh
+nix profile add github:chakanysystems/autolith-remote#autolith-bridge
+autolith-bridge
+```
+
+From a local checkout, use `nix run .`, `nix build .`, or `nix flake check`. The build checks that the installed executable starts and rejects a missing token configuration. Run the full test suite separately with Xcode's `swift test`; Nix's Darwin SwiftPM lacks Apple's XCTest runner. `nix build` puts the executable at `result/bin/autolith-bridge`. Commit `flake.lock` updates to pin the build tools for other users.
+
+Other flakes can use `inputs.autolith-remote.packages.${system}.autolith-bridge`. The derivation in `nix/package.nix` can also be used with `pkgs.callPackage`. To start the installed bridge at login, use a per-user launchd agent and supply absolute backend and token paths in its environment.
+
 ## Sessions and permissions
 
 Recent transcripts appear immediately from a protected local cache while the Mac validates their content revision. The cache retains up to 12 conversations, targets 32 MiB in memory, and caps its atomic disk snapshot at 64 MiB. Cache files are excluded from backups and separated by authenticated endpoint. Cached content can be viewed offline; the Mac remains authoritative when connected.
