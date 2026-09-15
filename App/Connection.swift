@@ -72,6 +72,7 @@ struct Reply: Codable, Sendable {
     private var fetches: [String: Task<Void, Never>] = [:]
     private var sessionEpochs: [String: UUID] = [:]
     private var persistTask: Task<Void, Never>?
+    private var persistenceRevision = 0
     private var maintenanceTask: Task<Void, Never>?
     private var maintenanceDirty = false
     private var readQueue: [String: Set<String>] = [:]
@@ -214,7 +215,7 @@ struct Reply: Codable, Sendable {
             let reply = try await call(["operation": "list"])
             guard generation == self.generation else { return }
             listSucceeded = true
-            if let updated = reply.sessions, sessions != updated { sessions = updated }
+            if let updated = reply.sessions, sessions != updated { sessions = updated; persistCache() }
             if !online { online = true }
             let valid = Set(sessions.map(\.id))
             var removedCachedSession = false
@@ -244,7 +245,7 @@ struct Reply: Codable, Sendable {
             guard generation == self.generation else { return }
             await activities.update(sessions, connection: self)
             guard generation == self.generation else { return }
-            persistCache(); flushReadReceipts()
+            flushReadReceipts()
             scheduleMaintenance()
         } catch {
             guard generation == self.generation else { return }
@@ -285,7 +286,8 @@ struct Reply: Codable, Sendable {
                 self.cached[id] = prepared.snapshot
                 if prepared.changed || self.events[id] == nil { self.events[id] = prepared.snapshot.events; self.scheduleMaintenance() }
                 self.transcriptRefreshedAt[id] = Date()
-                self.trimCache(); self.persistCache()
+                self.trimCache()
+                if prepared.changed || snapshot.revision != prepared.snapshot.revision { self.persistCache() }
             } catch {
                 if !Task.isCancelled, self.generation == generation { self.error = error.localizedDescription }
             }
@@ -353,14 +355,19 @@ struct Reply: Codable, Sendable {
     }
 
     private func persistCache() {
+        persistenceRevision += 1
         guard persistTask == nil else { return }
         let key = TranscriptCache.key(host: host, token: token)
         let generation = self.generation
         persistTask = Task {
             defer { if self.generation == generation { persistTask = nil } }
             do {
-                try await Task.sleep(for: .milliseconds(500))
-                try await TranscriptCache.shared.save(.init(sessions: sessions, transcripts: cached), key: key)
+                var saved: Int
+                repeat {
+                    try await Task.sleep(for: .milliseconds(500))
+                    saved = persistenceRevision
+                    try await TranscriptCache.shared.save(.init(sessions: sessions, transcripts: cached), key: key)
+                } while generation == self.generation && saved != persistenceRevision
             } catch { if !Task.isCancelled { UserDefaults.standard.set(error.localizedDescription, forKey: "transcriptCacheError") } }
         }
     }
