@@ -5,12 +5,12 @@ import UIKit
 @main struct AutolithApp: App {
     @UIApplicationDelegateAdaptor(NotificationAppDelegate.self) private var notificationDelegate
     init() { AutolithShortcuts.updateAppShortcutParameters() }
-    @StateObject private var connection = Connection(restoreCache: true)
+    @State private var connection = Connection(restoreCache: true)
     var body: some Scene { WindowGroup { SessionBrowser(connection: connection) } }
 }
 
 struct SessionBrowser: View {
-    @ObservedObject var connection: Connection
+    @Bindable var connection: Connection
     @Environment(\.scenePhase) private var phase
     @State private var settings = false
     @State private var creating = false
@@ -81,12 +81,14 @@ struct SessionBrowser: View {
 }
 
 struct ConversationView: View {
-    @ObservedObject var connection: Connection
+    @Bindable var connection: Connection
     let session: Session
     @State private var stopping = false
     @State private var history = ConversationHistoryWindow()
-    private var eventIDs: [String] { (connection.events[session.id] ?? []).map(\.id) }
+    @State private var latestRequest = 0
+    private var eventIDs: [String] { connection.eventIdentifiers(for: session.id) }
     private var historyStart: Int { history.startIndex(in: eventIDs) }
+    private var historyRange: Range<Int> { history.range(in: eventIDs) }
     var body: some View {
         VStack(spacing: 0) {
             if !session.isRunning {
@@ -94,10 +96,10 @@ struct ConversationView: View {
                     Label("Session stopped. Your conversation is saved.", systemImage: "stop.circle")
                     Spacer()
                     Button("Resume session") { Task { await connection.resume(session) } }
-                        .disabled(connection.busy || !connection.online)
+                        .disabled(connection.isBusy(session.id) || !connection.online)
                 }.font(.callout).padding()
             }
-            ConversationScrollView {
+            ConversationScrollView(content: {
                 if historyStart > 0 {
                     Button("Show earlier messages (\(historyStart))") { history.showEarlier(eventIDs) }
                         .font(.callout).frame(maxWidth: .infinity).padding(.vertical, 8)
@@ -107,15 +109,25 @@ struct ConversationView: View {
                 } else if (connection.events[session.id] ?? []).isEmpty {
                     ContentUnavailableView("Ready when you are", systemImage: "text.bubble", description: Text("Send a message to begin. Completed messages and tool activity appear here."))
                 }
-                ForEach((connection.events[session.id] ?? []).dropFirst(historyStart)) { event in
+                ForEach((connection.events[session.id] ?? []).dropFirst(historyStart).prefix(history.pageSize)) { event in
                     ConversationEventView(event: event, presentation: connection.presentation(eventID: event.id, sessionID: session.id),
                                           retryMessage: { outboxAction("message-retry", event: event) },
                                           abandonMessage: { outboxAction("message-abandon", event: event) },
-                                          controlsEnabled: connection.online && !connection.busy)
+                                          controlsEnabled: connection.online && !connection.isBusy(session.id))
                         .modifier(AutolithMessageAnnotation(connection: connection, host: connection.host, sessionID: session.id, event: event))
                         .id(event.id)
                 }
-            }
+                if historyRange.upperBound < eventIDs.count {
+                    HStack {
+                        Button("Show newer messages") {
+                            history.showNewer(eventIDs)
+                            if history.followsLatest { latestRequest += 1 }
+                        }
+                        Spacer()
+                        Button("Latest messages") { history.showLatest(eventIDs); latestRequest += 1 }
+                    }.font(.callout)
+                }
+            }, followingChanged: { history.setFollowing($0, ids: eventIDs) }, latestRequest: latestRequest)
             SessionComposer(connection: connection, session: session)
         }
         .navigationTitle(session.title).navigationBarTitleDisplayMode(.inline)
@@ -133,7 +145,7 @@ struct ConversationView: View {
                 Menu {
                     Button("Pause", systemImage: "pause") {
                         Task { _ = await connection.control("pause", id: session.id) }
-                    }.disabled(connection.busy || !connection.online || !session.isRunning)
+                    }.disabled(connection.isBusy(session.id) || !connection.online || !session.isRunning)
                     if session.jobs > 0 { Text("\(session.jobs) jobs") }
                     if session.queued > 0 { Text("\(session.queued) queued") }
                     Text(session.workspace)
@@ -163,7 +175,7 @@ struct ConversationView: View {
 }
 
 struct SettingsView: View {
-    @ObservedObject var connection: Connection
+    @Bindable var connection: Connection
     @Environment(\.dismiss) private var dismiss
 
     private var connectionStatus: String {
@@ -246,7 +258,7 @@ struct SettingsView: View {
 }
 
 private struct ConnectionEditor: View {
-    @ObservedObject var connection: Connection
+    @Bindable var connection: Connection
     @Environment(\.dismiss) private var dismiss
     @State private var host: String
     @State private var token: String
@@ -339,7 +351,7 @@ private struct ConnectionEditor: View {
 }
 
 private struct SiriSettingsPage: View {
-    @ObservedObject var connection: Connection
+    @Bindable var connection: Connection
 
     var body: some View {
         Form {
@@ -351,7 +363,7 @@ private struct SiriSettingsPage: View {
 
 #if !targetEnvironment(macCatalyst)
 private struct LiveActivitySettingsPage: View {
-    @ObservedObject var connection: Connection
+    @Bindable var connection: Connection
     @AppStorage("liveActivitiesEnabled") private var liveActivities = false
 
     var body: some View {
@@ -412,7 +424,7 @@ private struct ConnectionSetupHelp: View {
 }
 
 struct NewSessionView: View {
-    @ObservedObject var connection: Connection
+    @Bindable var connection: Connection
     @Environment(\.dismiss) private var dismiss
     @State private var workspace = ""
     @State private var permissions = "ask"

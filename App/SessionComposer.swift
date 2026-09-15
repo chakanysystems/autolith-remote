@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct SessionComposer: View {
-    @ObservedObject var connection: Connection
+    @Bindable var connection: Connection
     let session: Session
     @State private var editRevision = 0
     @State private var selection = NSRange(location: 0, length: 0)
@@ -15,7 +15,7 @@ struct SessionComposer: View {
         return Array(connection.completions.filter { $0.name.lowercased().hasPrefix(context.prefix.lowercased()) }
             .sorted { $0.name < $1.name }.prefix(6))
     }
-    private var canSend: Bool { !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && session.isRunning && connection.online && !connection.busy }
+    private var canSend: Bool { !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && session.isRunning && connection.online && !connection.isBusy(session.id) }
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if !matches.isEmpty {
@@ -50,7 +50,7 @@ struct SessionComposer: View {
                         }
                     }
                     .modifier(ComposerInputGlass())
-                    ComposerSendButton(lisp: lisp, busy: connection.busy, enabled: canSend) { send() }
+                    ComposerSendButton(lisp: lisp, busy: connection.isBusy(session.id), enabled: canSend) { send() }
                 }
             }
             HStack(spacing: 12) {
@@ -81,7 +81,7 @@ struct SessionComposer: View {
                 .accessibilityIdentifier("composer-effort")
             }
             .font(.caption).foregroundStyle(.secondary).buttonStyle(.plain)
-            .disabled(!session.isRunning || !connection.online || connection.busy)
+            .disabled(!session.isRunning || !connection.online || connection.isBusy(session.id))
             if lisp {
                 Label("Lisp runs in this session on your computer", systemImage: "terminal").font(.caption).foregroundStyle(.secondary)
             }
@@ -107,7 +107,7 @@ struct SessionComposer: View {
     private func send(_ nativeText: String? = nil) {
         let message = nativeText ?? draft
         guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              session.isRunning, connection.online, !connection.busy else { return }
+              session.isRunning, connection.online, !connection.isBusy(session.id) else { return }
         let donate = !lisp && !message.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/")
         let sequence = connection.events[session.id]?.compactMap { Int($0.id) }.max() ?? 0
         Task {

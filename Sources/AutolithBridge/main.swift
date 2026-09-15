@@ -94,11 +94,17 @@ func execute(_ body: Data, context: BackendRequestContext = BackendRequestContex
             return Data("{\"ok\":true}".utf8)
         }
         if object["operation"] as? String == "transcript-sync", let id = object["id"] as? String {
+            func source() throws -> String { try backend.transcriptRevision(id, context: context) + ":" + messageService.outbox.revision }
+            let before = try source()
+            if let cached = transcripts.cachedResponse(sessionID: id, source: before, revision: object["revision"] as? String) {
+                return try JSONSerialization.data(withJSONObject: cached)
+            }
             let raw = try executeAutolith(JSONSerialization.data(withJSONObject: ["operation": "transcript", "id": id, "after": 0]), context: context)
             let reply = try JSONSerialization.jsonObject(with: raw) as? [String: Any] ?? [:]
             if reply["error"] != nil { return raw }
             let decorated = messageService.decorateTranscript(reply, sessionID: id)
-            return try JSONSerialization.data(withJSONObject: transcripts.response(sessionID: id, events: decorated["events"] as? [[String: Any]] ?? [], revision: object["revision"] as? String))
+            let after = try source()
+            return try JSONSerialization.data(withJSONObject: transcripts.response(sessionID: id, events: decorated["events"] as? [[String: Any]] ?? [], revision: object["revision"] as? String, source: before == after ? after : nil))
         }
         if object["operation"] as? String == "transcript", let id = object["id"] as? String {
             let reply = try JSONSerialization.jsonObject(with: executeAutolith(body, context: context)) as? [String: Any] ?? [:]
@@ -143,33 +149,66 @@ func executeAutolith(_ body: Data, context: BackendRequestContext = BackendReque
 final class Client {
     let connection: BridgeConnection
     let id = UUID()
-    let context = BackendRequestContext(deadline: .now() + 65)
+    var context = BackendRequestContext(deadline: .now() + 65)
     var authenticated = false
     var dispatched = false
     var data = Data()
     var finished = false
     var stream: EventStream?
+    var keepAlive = false
+    var inputEnded = false
+    var readPending = false
+    var cycle = UUID()
+    var bodyStarted = false
     func disconnected() { context.cancel(); stream?.stop(); stream = nil }
     init(_ connection: BridgeConnection) { self.connection = connection }
     func reply(_ status: Int, _ body: Data) {
         guard !finished else { return }; finished = true
         context.cancel()
-        data.removeAll()
-        let head = "HTTP/1.1 \(status) Response\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
-        connection.send(Data(head.utf8) + body) { _ in self.connection.cancel() }
+        let reuse = status == 200 && keepAlive && !inputEnded
+        let head = "HTTP/1.1 \(status) Response\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\nCache-Control: no-store\r\nConnection: \(reuse ? "keep-alive" : "close")\r\n\r\n"
+        connection.send(Data(head.utf8) + body) { error in
+            guard error == nil, reuse, !self.inputEnded else { self.connection.cancel(); return }
+            self.context = BackendRequestContext(deadline: .now() + 65)
+            self.finished = false; self.dispatched = false; self.keepAlive = false
+            self.bodyStarted = false
+            self.cycle = UUID()
+            self.armDeadlines()
+            if !self.data.isEmpty { self.consume(nil, ended: false, error: nil) }
+            else { self.receive() }
+        }
     }
     func fail(_ status: Int, _ text: String) { reply(status, (try? JSONSerialization.data(withJSONObject: ["error": text])) ?? Data()) }
     func authenticate(_ authorization: String) -> Bool {
-        if authenticated { return true }
         guard authorized(authorization) else { fail(401, "Invalid companion token"); return false }
+        if authenticated { return true }
         guard admission.authenticate(id) else { fail(503, "Too many authenticated connections"); return false }
         authenticated = true
         return true
     }
     func receive() {
+        guard !readPending else { return }
+        readPending = true
         connection.receive { bytes, ended, error in
-            guard !self.finished else { return }
-            if let bytes { self.data.append(bytes) }
+            self.readPending = false
+            self.consume(bytes, ended: ended, error: error)
+        }
+    }
+    func consume(_ bytes: Data?, ended: Bool, error: Error?) {
+            inputEnded = inputEnded || ended
+            if let bytes { data.append(bytes) }
+            guard data.count <= 280_000 else { context.cancel(); connection.cancel(); return }
+            if error != nil { context.cancel(); connection.cancel(); return }
+            // One bounded next request may arrive while the response write completes.
+            guard !dispatched, !finished else { return }
+            if !data.isEmpty, !bodyStarted {
+                bodyStarted = true
+                let cycle = self.cycle
+                queue.asyncAfter(deadline: .now() + 15) { [weak self] in
+                    guard let self, self.cycle == cycle, !self.finished, !self.dispatched else { return }
+                    self.fail(408, "Request body timed out")
+                }
+            }
             do {
                 if self.data.starts(with: Data("GET ".utf8)) {
                     if let upgrade = try WebSocketUpgrade.parse(self.data) {
@@ -180,7 +219,8 @@ final class Client {
                         }
                         guard streamSlots.wait(timeout: .now()) == .success else { self.fail(503, "Too many event streams"); return }
                         self.finished = true
-                        let stream = EventStream(connection: self.connection, queue: queue, backend: backend) { streamSlots.signal() }
+                        let stream = EventStream(connection: self.connection, queue: queue, backend: backend,
+                                                 receiptRevision: { messageService.outbox.revision }) { streamSlots.signal() }
                         self.stream = stream
                         let remainder = Data(self.data.dropFirst(upgrade.consumedBytes))
                         self.data.removeAll()
@@ -196,14 +236,9 @@ final class Client {
                     if let request = try HTTPRequest.parse(self.data) {
                         guard slots.wait(timeout: .now()) == .success else { self.fail(503, "Companion is busy"); return }
                         self.dispatched = true
-                        // Reject a second request or transport failure, but allow
-                        // a client to half-close its request and still read the reply.
-                        self.connection.receive { bytes, _, error in
-                            if error != nil || bytes?.isEmpty == false {
-                                self.context.cancel()
-                                self.connection.cancel()
-                            }
-                        }
+                        self.keepAlive = request.keepAlive
+                        self.data.removeAll(keepingCapacity: true)
+                        self.receive()
                         let context = self.context
                         workers.async {
                             defer { slots.signal() }
@@ -219,6 +254,17 @@ final class Client {
                     else { self.receive() }
                 }
             } catch { self.fail(400, error.localizedDescription) }
+    }
+    func armDeadlines() {
+        let cycle = self.cycle
+        queue.asyncAfter(deadline: .now() + (authenticated ? 30 : 5)) { [weak self] in
+            guard let self, self.cycle == cycle, !self.finished, !self.dispatched,
+                  !self.authenticated || !self.bodyStarted else { return }
+            self.fail(408, "Request header or body timed out")
+        }
+        queue.asyncAfter(deadline: context.deadline) { [weak self] in
+            guard let self, self.cycle == cycle, !self.finished else { return }
+            self.fail(408, "Request deadline exceeded. A dispatched mutation may have run; check the conversation before retrying.")
         }
     }
 }
@@ -267,17 +313,7 @@ try listener.start(port: port) { connection in
         connection.onClose = nil
     }
     client.receive()
-    queue.asyncAfter(deadline: .now() + 5) { [weak client] in
-        if let client, !client.finished, !client.authenticated { client.fail(408, "Authentication handshake timed out") }
-    }
-    queue.asyncAfter(deadline: .now() + 15) { [weak client] in
-        if let client, !client.finished, !client.dispatched { client.fail(408, "Request body timed out") }
-    }
-    queue.asyncAfter(deadline: client.context.deadline) { [weak client] in
-        if let client, !client.finished {
-            client.fail(408, "Request deadline exceeded. A dispatched mutation may have run; check the conversation before retrying.")
-        }
-    }
+    client.armDeadlines()
 }
 } catch {
     lifecycle.sync { managedBackend.stop() }

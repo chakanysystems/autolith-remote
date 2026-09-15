@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct WorkspacePicker: View {
-    @ObservedObject var connection: Connection
+    @Bindable var connection: Connection
     @Binding var selection: String
     @Environment(\.dismiss) private var dismiss
     @State private var directory = ""

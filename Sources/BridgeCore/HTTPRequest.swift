@@ -8,10 +8,12 @@ public enum BridgeError: Error, LocalizedError {
 public struct HTTPRequest {
     public let body: Data
     public let authorization: String
+    public let keepAlive: Bool
     public struct Header {
         public let authorization: String
         public let contentLength: Int
         public let bodyOffset: Int
+        public let keepAlive: Bool
     }
 
     /// Complete framing validation before accepting a potentially slow request body.
@@ -34,7 +36,8 @@ public struct HTTPRequest {
         }
         guard headers["transfer-encoding"] == nil,
               let raw = headers["content-length"], let count = Int(raw), (0...262144).contains(count) else { throw BridgeError.invalid("Invalid content length") }
-        return Header(authorization: headers["authorization"] ?? "", contentLength: count, bodyOffset: boundary.upperBound)
+        let close = headers["connection"]?.lowercased().split(separator: ",").contains { $0.trimmingCharacters(in: .whitespaces) == "close" } == true
+        return Header(authorization: headers["authorization"] ?? "", contentLength: count, bodyOffset: boundary.upperBound, keepAlive: !close)
     }
 
     public static func parse(_ data: Data) throws -> HTTPRequest? {
@@ -42,6 +45,6 @@ public struct HTTPRequest {
         let available = data.count - header.bodyOffset
         guard available >= header.contentLength else { return nil }
         guard available == header.contentLength else { throw BridgeError.invalid("Pipelining is unsupported") }
-        return HTTPRequest(body: Data(data[header.bodyOffset...]), authorization: header.authorization)
+        return HTTPRequest(body: Data(data[header.bodyOffset...]), authorization: header.authorization, keepAlive: header.keepAlive)
     }
 }

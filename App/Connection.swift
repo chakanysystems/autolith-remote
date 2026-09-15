@@ -1,4 +1,5 @@
 import SwiftUI
+import Observation
 import Security
 
 extension Session {
@@ -24,19 +25,19 @@ struct Reply: Codable, Sendable {
     var state: String?; var requestID: String?
 }
 
-@MainActor final class Connection: ObservableObject {
-    @Published var sessions: [Session] = []
-    @Published var events: [String: [Event]] = [:]
-    @Published var drafts: [String: String] = [:]
-    @Published var selection: String? { didSet {
+@MainActor @Observable final class Connection {
+    var sessions: [Session] = []
+    var events: [String: [Event]] = [:]
+    var drafts: [String: String] = [:]
+    var selection: String? { didSet {
         if oldValue != selection {
             restartStream()
             if let id = selection { Task { await self.loadTranscript(id) } }
         }
     } }
-    @Published private(set) var streamStatus = "Live activity disconnected"
-    @Published private(set) var streamConnected = false
-    @Published private(set) var liveEvents: [Event] = []
+    private(set) var streamStatus = "Live activity disconnected"
+    private(set) var streamConnected = false
+    private(set) var liveEvents: [Event] = []
     private var foreground = false
     private var streamTask: Task<Void, Never>?
     private var transcriptTask: Task<Void, Never>?
@@ -46,19 +47,22 @@ struct Reply: Codable, Sendable {
     private var transcriptRefreshedAt: [String: Date] = [:]
     private var stream: SessionStream?
     private var streamGeneration = UUID()
-    @Published var online = false
-    @Published var error: String?
-    @Published var busy = false
-    @Published private(set) var host = UserDefaults.standard.string(forKey: "host") ?? ""
-    @Published private(set) var token = ""
-    @Published private(set) var refreshing = false
-    @Published private(set) var loadingTranscript: String?
-    @Published private(set) var loadingCatalog = false
-    @Published var models: [ModelOption] = []
-    @Published var completions: [CompletionOption] = []
-    @Published var catalogError: String?
-    @Published var activityError: String?
-    @Published var activityStatus = "Waiting for session status." {
+    var online = false
+    var error: String?
+    private var creatingSession = false
+    private var commands = SessionCommandState()
+    var busy: Bool { creatingSession || selection.map { commands.contains($0) } == true }
+    func isBusy(_ id: String) -> Bool { creatingSession || commands.contains(id) }
+    private(set) var host = UserDefaults.standard.string(forKey: "host") ?? ""
+    private(set) var token = ""
+    private(set) var refreshing = false
+    private(set) var loadingTranscript: String?
+    private(set) var loadingCatalog = false
+    var models: [ModelOption] = []
+    var completions: [CompletionOption] = []
+    var catalogError: String?
+    var activityError: String?
+    var activityStatus = "Waiting for session status." {
         didSet { UserDefaults.standard.set(activityStatus, forKey: "liveActivityStatus") }
     }
     let activities = LiveActivityController.shared
@@ -68,10 +72,11 @@ struct Reply: Codable, Sendable {
     var context: ConnectionContext { ConnectionContext(host: host, token: token, generation: generation) }
     func isCurrent(_ captured: ConnectionContext) -> Bool { context == captured }
     private(set) var switching = false
-    private var cached: [String: CachedTranscript] = [:]
+    @ObservationIgnored private var cached: [String: CachedTranscript] = [:]
     private var fetches: [String: Task<Void, Never>] = [:]
     private var sessionEpochs: [String: UUID] = [:]
     private var persistTask: Task<Void, Never>?
+    private var persistenceRevision = 0
     private var maintenanceTask: Task<Void, Never>?
     private var maintenanceDirty = false
     private var readQueue: [String: Set<String>] = [:]
@@ -110,9 +115,9 @@ struct Reply: Codable, Sendable {
     }
     func updateOutbox(_ operation: String, event: Event, sessionID: String, context captured: ConnectionContext) async {
         let allowed = operation == "message-retry" ? event.canRetryDelivery : operation == "message-abandon" && event.canAbandonDelivery
-        guard isCurrent(captured), !switching, !busy, allowed else { return }
-        busy = true
-        defer { if isCurrent(captured) { busy = false } }
+        guard isCurrent(captured), !switching, !creatingSession, allowed,
+              let command = commands.begin(sessionID) else { return }
+        defer { commands.finish(sessionID, token: command) }
         do {
             let reply = try await call(["operation": operation, "id": sessionID, "eventID": event.id], context: captured)
             guard isCurrent(captured), !Task.isCancelled else { return }
@@ -147,7 +152,7 @@ struct Reply: Codable, Sendable {
         guard previous.host != candidate.host || previous.token != candidate.token else { return }
         // Invalidate in-flight UI work before waiting for old-identity revocation.
         generation += 1
-        refreshing = false; busy = false; loadingTranscript = nil; loadingCatalog = false
+        refreshing = false; commands.clear(); creatingSession = false; loadingTranscript = nil; loadingCatalog = false
         catalogRequest = UUID()
         persistTask?.cancel(); persistTask = nil; maintenanceTask?.cancel(); maintenanceTask = nil
         readTask?.cancel(); readTask = nil
@@ -174,7 +179,7 @@ struct Reply: Codable, Sendable {
         fetches.values.forEach { $0.cancel() }; fetches = [:]; cached = [:]; sessionEpochs = [:]
         stopStream()
         events = [:]; sessions = []; drafts = [:]; online = false
-        refreshing = false; loadingTranscript = nil; busy = false; loadingCatalog = false
+        refreshing = false; loadingTranscript = nil; commands.clear(); creatingSession = false; loadingCatalog = false
         models = []; completions = []; catalogSession = nil; catalogRequest = UUID(); selection = nil
         let saved = context
         try await TranscriptCache.shared.activate(key: TranscriptCache.key(host: saved.host, token: saved.token))
@@ -200,7 +205,11 @@ struct Reply: Codable, Sendable {
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
         let (data, response) = try await BoundedHTTP.data(for: request, limit: BoundedHTTP.limit(operation: payload["operation"] as? String ?? ""))
         guard response.statusCode == 200 else { throw failure("The computer companion rejected the request (\(response.statusCode)).") }
-        let reply = try await BackgroundWork.run { try JSONDecoder().decode(Reply.self, from: data) }
+        let reply = try await BackgroundWork.run {
+            let interval = PerformanceInterval(.decoding)
+            defer { interval.finish(bytes: data.count) }
+            return try JSONDecoder().decode(Reply.self, from: data)
+        }
         if let message = reply.error { throw failure(message) }
         return reply
     }
@@ -214,7 +223,7 @@ struct Reply: Codable, Sendable {
             let reply = try await call(["operation": "list"])
             guard generation == self.generation else { return }
             listSucceeded = true
-            if let updated = reply.sessions, sessions != updated { sessions = updated }
+            if let updated = reply.sessions, sessions != updated { sessions = updated; persistCache() }
             if !online { online = true }
             let valid = Set(sessions.map(\.id))
             var removedCachedSession = false
@@ -244,7 +253,7 @@ struct Reply: Codable, Sendable {
             guard generation == self.generation else { return }
             await activities.update(sessions, connection: self)
             guard generation == self.generation else { return }
-            persistCache(); flushReadReceipts()
+            flushReadReceipts()
             scheduleMaintenance()
         } catch {
             guard generation == self.generation else { return }
@@ -282,10 +291,13 @@ struct Reply: Codable, Sendable {
                     prepared = try await Self.prepareTranscript(snapshot, reply: reply)
                 }
                 guard !Task.isCancelled, self.generation == generation, self.sessionEpochs[id] == epoch else { return }
+                let publication = PerformanceInterval(.publication)
                 self.cached[id] = prepared.snapshot
                 if prepared.changed || self.events[id] == nil { self.events[id] = prepared.snapshot.events; self.scheduleMaintenance() }
+                publication.finish()
                 self.transcriptRefreshedAt[id] = Date()
-                self.trimCache(); self.persistCache()
+                self.trimCache()
+                if prepared.changed || snapshot.revision != prepared.snapshot.revision { self.persistCache() }
             } catch {
                 if !Task.isCancelled, self.generation == generation { self.error = error.localizedDescription }
             }
@@ -296,6 +308,8 @@ struct Reply: Codable, Sendable {
 
     nonisolated private static func prepareTranscript(_ original: CachedTranscript, reply: Reply) async throws -> (snapshot: CachedTranscript, changed: Bool) {
         try await BackgroundWork.run {
+            let interval = PerformanceInterval(.reconciliation)
+            defer { interval.finish() }
             guard let revision = reply.revision else { throw CachedTranscript.CacheError.invalidRevision }
             var snapshot = original
             try snapshot.reconcile(revision: revision, base: reply.baseRevision, order: reply.eventOrder,
@@ -324,6 +338,10 @@ struct Reply: Codable, Sendable {
         cached[sessionID]?.presentations[eventID]
     }
 
+    func eventIdentifiers(for sessionID: String) -> [String] {
+        cached[sessionID]?.eventIDs ?? []
+    }
+
     func shareText(for sessionID: String) -> String {
         cached[sessionID]?.shareText ?? ""
     }
@@ -340,27 +358,37 @@ struct Reply: Codable, Sendable {
                     let batch = Array((readQueue[id] ?? []).prefix(100))
                     let reply = try await call(["operation": "messages-read", "id": id, "eventIDs": batch])
                     guard !Task.isCancelled, self.generation == generation else { return }
-                    guard reply.ok == true, reply.readIDs != nil else { throw failure("Read receipts were not confirmed.") }
+                    guard reply.ok == true, let confirmed = reply.readIDs else { throw failure("Read receipts were not confirmed.") }
                     readQueue[id]?.subtract(batch)
                     if readQueue[id]?.isEmpty == true { readQueue[id] = nil }
                     // Finish any pre-acknowledgment fetch before reconciling read state.
                     if let pending = fetches[id] { await pending.value }
                     guard !Task.isCancelled, self.generation == generation else { return }
-                    await loadTranscript(id)
+                    if var snapshot = cached[id], snapshot.confirmRead(Set(confirmed).intersection(batch)) {
+                        cached[id] = snapshot
+                        events[id] = snapshot.events
+                        persistCache()
+                        scheduleMaintenance()
+                    }
                 }
             } catch { if !Task.isCancelled { UserDefaults.standard.set(error.localizedDescription, forKey: "readReceiptError") } }
         }
     }
 
     private func persistCache() {
+        persistenceRevision += 1
         guard persistTask == nil else { return }
         let key = TranscriptCache.key(host: host, token: token)
         let generation = self.generation
         persistTask = Task {
             defer { if self.generation == generation { persistTask = nil } }
             do {
-                try await Task.sleep(for: .milliseconds(500))
-                try await TranscriptCache.shared.save(.init(sessions: sessions, transcripts: cached), key: key)
+                var saved: Int
+                repeat {
+                    try await Task.sleep(for: .milliseconds(500))
+                    saved = persistenceRevision
+                    try await TranscriptCache.shared.save(.init(sessions: sessions, transcripts: cached), key: key)
+                } while generation == self.generation && saved != persistenceRevision
             } catch { if !Task.isCancelled { UserDefaults.standard.set(error.localizedDescription, forKey: "transcriptCacheError") } }
         }
     }
@@ -536,24 +564,24 @@ struct Reply: Codable, Sendable {
         return await control("tell", id: session.id, message: command)
     }
     func control(_ operation: String, id: String, message: String? = nil) async -> Bool {
-        guard !switching, !busy else { return false }
+        guard !switching, !creatingSession, let command = commands.begin(id) else { return false }
         let captured = context
-        busy = true
-        defer { if isCurrent(captured) { busy = false } }
+        defer { commands.finish(id, token: command) }
         do {
             var payload: [String: Any] = ["operation": operation, "id": id]
             if let message { payload["message"] = message }
-            _ = try await call(payload, context: captured)
+            let reply = try await call(payload, context: captured)
+            try SiriMessageReceipt.confirmed(reply.ok)
             guard isCurrent(captured), !Task.isCancelled else { return false }
-            await refresh()
-            return isCurrent(captured) && !Task.isCancelled
+            reconcileAfterCommand(id: id, context: captured)
+            return true
         } catch { if isCurrent(captured) { self.error = error.localizedDescription }; return false }
     }
     func create(workspace: String, permissions: String) async -> Bool {
-        guard !switching, !busy else { return false }
+        guard !switching, !creatingSession else { return false }
         let captured = context
-        busy = true
-        defer { if isCurrent(captured) { busy = false } }
+        creatingSession = true
+        defer { if isCurrent(captured) { creatingSession = false } }
         do {
             let reply = try await call(["operation": "create", "workspace": workspace, "permissions": permissions], context: captured)
             guard isCurrent(captured), !Task.isCancelled else { return false }
@@ -563,10 +591,9 @@ struct Reply: Codable, Sendable {
         } catch { if isCurrent(captured) { self.error = error.localizedDescription }; return false }
     }
     func resume(_ session: Session) async {
-        guard !switching, !busy else { return }
+        guard !switching, !creatingSession, let command = commands.begin(session.id) else { return }
         let captured = context
-        busy = true
-        defer { if isCurrent(captured) { busy = false } }
+        defer { commands.finish(session.id, token: command) }
         do {
             let reply = try await call(["operation": "resume", "id": session.id,
                                         "workspace": session.workspace, "permissions": "ask"], context: captured)
@@ -587,6 +614,18 @@ struct Reply: Codable, Sendable {
             guard isCurrent(captured) else { return }
             scheduleMaintenance()
             if selection == session.id { selection = nil }
+        }
+    }
+
+    /// Acknowledgement releases the composer; authoritative history catches up separately.
+    private func reconcileAfterCommand(id: String, context captured: ConnectionContext) {
+        Task {
+            guard isCurrent(captured) else { return }
+            if let pending = fetches[id] { await pending.value }
+            guard isCurrent(captured), !Task.isCancelled else { return }
+            await loadTranscript(id)
+            guard isCurrent(captured), !Task.isCancelled else { return }
+            await refresh()
         }
     }
 }

@@ -8,6 +8,7 @@ final class EventStream {
     private let queue: DispatchQueue
     private let backend: BackendPool
     private let onClose: () -> Void
+    private let receiptRevision: () -> String
     private var decoder = WebSocketDecoder(maximumMessageBytes: 8192)
     private var pollTimer: DispatchSourceTimer?
     private var pollInFlight = false
@@ -22,8 +23,10 @@ final class EventStream {
     private var epoch = ""
     private var sequence = 0
 
-    init(connection: BridgeConnection, queue: DispatchQueue, backend: BackendPool, onClose: @escaping () -> Void) {
+    init(connection: BridgeConnection, queue: DispatchQueue, backend: BackendPool,
+         receiptRevision: @escaping () -> String = { "" }, onClose: @escaping () -> Void) {
         self.connection = connection; self.queue = queue; self.backend = backend; self.onClose = onClose
+        self.receiptRevision = receiptRevision
     }
 
     func start(response: Data, remainder: Data) {
@@ -110,22 +113,19 @@ final class EventStream {
         DispatchQueue.global().async { [weak self] in
             guard let self else { return }
             let result: Result<[String: Any], Error> = Result {
-                let data = try self.backend.call(Data(#"{"operation":"list"}"#.utf8), context: context)
-                guard let reply = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let sessions = reply["sessions"] as? [[String: Any]],
-                      let status = sessions.first(where: { $0["id"] as? String == id }) else {
-                    throw BridgeError.invalid("Session is no longer available.")
-                }
-                return status
+                var snapshot = try self.backend.watchSnapshot(id, context: context)
+                snapshot["transcriptRevision"] = (snapshot["transcriptRevision"] as? String ?? "") + ":" + self.receiptRevision()
+                return snapshot
             }
             self.queue.async {
                 self.pollInFlight = false
                 self.pollContext = nil
                 guard !self.closing else { return }
                 switch result {
-                case .success(let status):
+                case .success(let snapshot):
                     let envelope: [String: Any] = ["version": 1, "type": "snapshot", "sessionID": id,
-                        "epoch": self.epoch, "sequence": self.sequence + 1, "status": status, "activity": []]
+                        "epoch": self.epoch, "sequence": self.sequence + 1, "status": snapshot["status"]!, "activity": [],
+                        "transcriptRevision": snapshot["transcriptRevision"]!]
                     do { self.consumeLine(try JSONSerialization.data(withJSONObject: envelope)) }
                     catch { self.fail("Could not encode session status.") }
                 case .failure(let error): self.fail(error.localizedDescription)

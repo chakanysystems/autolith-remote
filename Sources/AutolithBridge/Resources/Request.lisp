@@ -71,6 +71,44 @@
                       (active (conversation-storage-active-pathname pathname)))
                  (setf (gethash "updatedAt" session) (if active (or (file-write-date active) 0) 0))))
              (coerce sessions 'vector))))
+       (transcript-source ()
+         (let* ((identifier (required "id"))
+                (live (and application
+                           (string= identifier (application-session-id))
+                           (application-conversation application)))
+                (pathname (conversation-pathname-for-id configuration identifier))
+                (active (conversation-storage-active-pathname pathname))
+                (conversation (if active
+                                  (conversation-replay-load configuration identifier)
+                                  live))
+                (status
+                  (if live
+                      (status-json (localgroup-status-snapshot
+                                    (application-localgroup-session application)))
+                      (handler-case
+                          (status-json
+                           (getf (rest (localgroup-query-record
+                                        (localgroup--find-record configuration identifier)
+                                        ':status)) :status))
+                        (localgroup-error ()
+                          (when conversation
+                            (json-object "id" identifier
+                                         "title" (or (conversation-title conversation) "Saved session")
+                                         "state" "stopped"
+                                         "workspace" (or (conversation-origin-directory conversation) "")
+                                         "model" (or (conversation-model conversation) "")
+                                         "permissions" "ask" "queued" 0 "jobs" 0)))))))
+           (unless status
+             (error 'configuration-error :message "Conversation no longer exists."))
+           (json-object
+            "status" status
+            "files" (coerce (when active
+                              (mapcar #'namestring (conversation-storage-pathnames pathname)))
+                            'vector)
+            "context" (coerce (when conversation
+                                (context-events (conversation-user-operation-snapshot
+                                                 (or live conversation))))
+                              'vector))))
        (transcript ()
          (when (json-get request "requireCurrent") (current-application))
          (let* ((identifier (required "id"))
@@ -167,11 +205,14 @@
                                   :conversation-id (when resume-p (required "id")))))))))
     (json-encode
      (let ((operation (required "operation")))
+       (when (json-get request "requireCurrent")
+         (current-application))
        (cond
          ((string= operation "identity")
           (json-object "id" (application-session-id)))
          ((string= operation "list") (json-object "sessions" (sessions)))
          ((string= operation "transcript") (transcript))
+         ((string= operation "transcript-source") (transcript-source))
          ((string= operation "catalog") (catalog))
          ((string= operation "create") (spawn-session nil))
          ((string= operation "resume") (spawn-session t))

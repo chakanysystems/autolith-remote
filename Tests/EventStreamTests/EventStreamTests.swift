@@ -8,6 +8,28 @@ import Glibc
 @testable import AutolithBridge
 
 final class EventStreamTests: XCTestCase {
+    func testKeepAliveAuthenticatesEveryRequestAndHonorsClose() throws {
+        let fixture = try Fixture()
+        defer { fixture.stop() }
+        for closeExplicitly in [false, true] {
+            let socket = try fixture.connect()
+            defer { close(socket) }
+            for attempt in 0..<3 {
+                let body = #"{"operation":"capabilities"}"#
+                let token = attempt == 2 && !closeExplicitly ? "wrong" : fixture.token
+                let closeHeader = attempt == 2 && closeExplicitly ? "Connection: close\r\n" : ""
+                try write(socket, Data("POST /rpc HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer \(token)\r\n\(closeHeader)Content-Length: \(body.utf8.count)\r\n\r\n\(body)".utf8))
+                let response = try header(socket)
+                XCTAssertTrue(response.hasPrefix(attempt == 2 && !closeExplicitly ? "HTTP/1.1 401" : "HTTP/1.1 200"))
+                let line = try XCTUnwrap(response.components(separatedBy: "\r\n").first { $0.lowercased().hasPrefix("content-length:") })
+                let length = try XCTUnwrap(Int(line.dropFirst("content-length:".count).trimmingCharacters(in: .whitespaces)))
+                _ = try read(socket, length)
+                XCTAssertTrue(response.contains(attempt == 2 ? "Connection: close" : "Connection: keep-alive"))
+            }
+            var byte: UInt8 = 0
+            XCTAssertEqual(recv(socket, &byte, 1, 0), 0)
+        }
+    }
     func testSubscriptionValidation() throws {
         XCTAssertNoThrow(try EventStream.subscription(#"{"operation":"subscribe","id":"s","epoch":"e","after":0}"#))
         for after in ["-1", "true", "1.5", "null", "\"2\""] {
@@ -156,7 +178,9 @@ final class EventStreamTests: XCTestCase {
                     do { form = try server.receive(socket) } catch { return }
                     let request = try ManagementTestServer.request(form)
                     if request["operation"] as? String == "identity" { try server.reply(socket, ["id": "gateway"]) }
-                    else { try server.reply(socket, ["sessions": [["id": "s", "state": "idle"]]]) }
+                    else if request["operation"] as? String == "transcript-source" {
+                        try server.reply(socket, ["files": [], "context": [], "status": ["id": "s", "state": "idle"]])
+                    } else { try server.reply(socket, ["sessions": [["id": "s", "state": "idle"]]]) }
                 }
             }
             // Use this test run's product, including custom SwiftPM scratch paths.

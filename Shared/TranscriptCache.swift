@@ -12,9 +12,22 @@ struct CachedTranscript: Codable, Sendable {
     var byteCost: Int? = nil
     var presentations: [String: EventPresentation] = [:]
     var shareText: String = ""
+    var eventIDs: [String] = []
     private enum CodingKeys: String, CodingKey { case revision, events, accessed, byteCost }
     static let memoryLimit = 16 * 1024 * 1024
     static let eventLimit = 10_000
+
+    /// Apply only acknowledged receipts. The next sync obtains a canonical server revision.
+    mutating func confirmRead(_ identifiers: Set<String>) -> Bool {
+        var changed = false
+        for index in events.indices where identifiers.contains(events[index].id)
+            && ["user", "assistant"].contains(events[index].role) && !events[index].hasBeenRead {
+            events[index].isRead = true
+            changed = true
+        }
+        if changed { revision = "" }
+        return changed
+    }
 
     static func validate(_ events: [Event]) throws {
         guard events.count <= eventLimit else { throw CacheError.tooLarge }
@@ -55,6 +68,7 @@ struct CachedTranscript: Codable, Sendable {
         byteCost = events.reduce(0) { $0 + $1.text.utf8.count * 2 + $1.id.utf8.count + $1.tool.utf8.count + 512 } + shareText.utf8.count
     }
     mutating func preparePresentation(previous: [Event] = []) {
+        eventIDs = events.map(\.id)
         let old = Dictionary(previous.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
         var rendered: [String: EventPresentation] = [:]
         for (index, event) in events.enumerated() {
@@ -114,6 +128,8 @@ actor TranscriptCache {
         return snapshot
     }
     func save(_ snapshot: Snapshot, key: String) throws {
+        let interval = PerformanceInterval(.cacheWrite)
+        defer { interval.finish() }
         guard activeKey == nil || activeKey == key else { throw CancellationError() }
         try Task.checkCancellation()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

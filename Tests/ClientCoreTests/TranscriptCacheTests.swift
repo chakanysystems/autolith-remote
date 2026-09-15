@@ -2,6 +2,19 @@ import XCTest
 @testable import ClientCore
 
 final class TranscriptCacheTests: XCTestCase {
+    func testAcknowledgedReceiptsUpdateLocallyWithoutInventingServerRevision() {
+        var cache = CachedTranscript(revision: "old", events: [
+            Event(id: "1", role: "assistant", tool: "", text: "answer", isRead: false),
+            Event(id: "2", role: "assistant", tool: "", text: "unconfirmed", isRead: false),
+            Event(id: "3", role: "tool", tool: "read", text: "output", isRead: false)
+        ], accessed: Date())
+        XCTAssertTrue(cache.confirmRead(["1", "3", "deleted"]))
+        XCTAssertTrue(cache.events[0].hasBeenRead)
+        XCTAssertFalse(cache.events[1].hasBeenRead)
+        XCTAssertEqual(cache.events[2].isRead, false)
+        XCTAssertEqual(cache.revision, "")
+        XCTAssertFalse(cache.confirmRead(["1"]))
+    }
     func testResponseDividersFollowActivityAndTrackHistoryEdits() throws {
         for role in ["tool-call", "tool-result", "thinking", "user", "assistant"] {
             let preceding = Event(id: "before", role: role, tool: "", text: "Work")

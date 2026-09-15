@@ -4,6 +4,8 @@ import UIKit
 /// Keep content-size changes separate from the reader's scroll intent.
 struct ConversationScrollView<Content: View>: View {
     @ViewBuilder let content: () -> Content
+    var followingChanged: (Bool) -> Void = { _ in }
+    var latestRequest = 0
     @State private var scroll = ConversationScrollState()
     @State private var scrollRequest = 0
     @Namespace private var bottom
@@ -52,6 +54,11 @@ struct ConversationScrollView<Content: View>: View {
                 scroll.userScrollChanged(active: userScrolling,
                                          distanceFromBottom: Double(Metrics(context.geometry).distance))
                 if phase == .idle && scroll.shouldFollow { scrollRequest += 1 }
+            }
+            .onChange(of: scroll.shouldFollow) { _, following in followingChanged(following) }
+            .onChange(of: latestRequest) { _, _ in
+                scroll.requestLatest()
+                scrollRequest += 1
             }
             .task(id: scrollRequest) {
                 await Task.yield()
