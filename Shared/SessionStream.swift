@@ -30,6 +30,7 @@ struct SessionStream: Sendable {
         var kind: String?
         var payload: Payload?
         var error: String?
+        var transcriptRevision: String?
     }
     let sessionID: String
     private(set) var cursor: SessionStreamCursor?
@@ -38,6 +39,7 @@ struct SessionStream: Sendable {
     private(set) var transcriptChanged = false
     private(set) var statusChanged = false
     private(set) var activityChanged = false
+    private var transcriptRevision: String?
 
     mutating func receive(_ data: Data) throws -> Bool {
         transcriptChanged = false
@@ -54,12 +56,14 @@ struct SessionStream: Sendable {
         }
         if message.type == "snapshot" {
             guard let status = message.status, let activity = message.activity else { throw SessionStreamError.invalidEnvelope }
+            statusChanged = self.status != status
             self.status = status
-            statusChanged = true
             activityChanged = true
             self.activity = []
             for event in activity { upsert(event) }
-            transcriptChanged = true
+            transcriptChanged = cursor?.epoch != epoch || message.transcriptRevision == nil
+                || transcriptRevision != message.transcriptRevision
+            transcriptRevision = message.transcriptRevision
         } else if message.type == "event" {
             guard let cursor, cursor.epoch == epoch else { return try resnapshot() }
             if sequence <= cursor.sequence { return false }

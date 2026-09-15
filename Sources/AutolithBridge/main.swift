@@ -94,11 +94,17 @@ func execute(_ body: Data, context: BackendRequestContext = BackendRequestContex
             return Data("{\"ok\":true}".utf8)
         }
         if object["operation"] as? String == "transcript-sync", let id = object["id"] as? String {
+            func source() throws -> String { try backend.transcriptRevision(id, context: context) + ":" + messageService.outbox.revision }
+            let before = try source()
+            if let cached = transcripts.cachedResponse(sessionID: id, source: before, revision: object["revision"] as? String) {
+                return try JSONSerialization.data(withJSONObject: cached)
+            }
             let raw = try executeAutolith(JSONSerialization.data(withJSONObject: ["operation": "transcript", "id": id, "after": 0]), context: context)
             let reply = try JSONSerialization.jsonObject(with: raw) as? [String: Any] ?? [:]
             if reply["error"] != nil { return raw }
             let decorated = messageService.decorateTranscript(reply, sessionID: id)
-            return try JSONSerialization.data(withJSONObject: transcripts.response(sessionID: id, events: decorated["events"] as? [[String: Any]] ?? [], revision: object["revision"] as? String))
+            let after = try source()
+            return try JSONSerialization.data(withJSONObject: transcripts.response(sessionID: id, events: decorated["events"] as? [[String: Any]] ?? [], revision: object["revision"] as? String, source: before == after ? after : nil))
         }
         if object["operation"] as? String == "transcript", let id = object["id"] as? String {
             let reply = try JSONSerialization.jsonObject(with: executeAutolith(body, context: context)) as? [String: Any] ?? [:]
@@ -213,7 +219,8 @@ final class Client {
                         }
                         guard streamSlots.wait(timeout: .now()) == .success else { self.fail(503, "Too many event streams"); return }
                         self.finished = true
-                        let stream = EventStream(connection: self.connection, queue: queue, backend: backend) { streamSlots.signal() }
+                        let stream = EventStream(connection: self.connection, queue: queue, backend: backend,
+                                                 receiptRevision: { messageService.outbox.revision }) { streamSlots.signal() }
                         self.stream = stream
                         let remainder = Data(self.data.dropFirst(upgrade.consumedBytes))
                         self.data.removeAll()

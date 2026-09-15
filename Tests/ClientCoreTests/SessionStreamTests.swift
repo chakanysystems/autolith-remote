@@ -2,6 +2,27 @@ import XCTest
 @testable import ClientCore
 
 final class SessionStreamTests: XCTestCase {
+    func testSnapshotRevisionSuppressesUnchangedHistoryButResyncsAfterReconnect() throws {
+        var stream = SessionStream(sessionID: "s")
+        var body = try XCTUnwrap(JSONSerialization.jsonObject(with: message("snapshot")) as? [String: Any])
+        body["transcriptRevision"] = "a"
+        _ = try stream.receive(JSONSerialization.data(withJSONObject: body))
+        XCTAssertTrue(stream.transcriptChanged)
+        for sequence in 2...30 {
+            body["sequence"] = sequence
+            _ = try stream.receive(JSONSerialization.data(withJSONObject: body))
+            XCTAssertFalse(stream.transcriptChanged)
+        }
+        body["transcriptRevision"] = "b"
+        _ = try stream.receive(JSONSerialization.data(withJSONObject: body))
+        XCTAssertTrue(stream.transcriptChanged)
+        body["epoch"] = "reconnected"
+        _ = try stream.receive(JSONSerialization.data(withJSONObject: body))
+        XCTAssertTrue(stream.transcriptChanged)
+        body.removeValue(forKey: "transcriptRevision")
+        _ = try stream.receive(JSONSerialization.data(withJSONObject: body))
+        XCTAssertTrue(stream.transcriptChanged)
+    }
     private func message(_ type: String = "event", sequence: Int = 1, epoch: String = "a", id: String = "s", eventID: String = "e", text: String = "hello") throws -> Data {
         var body: [String: Any] = ["version": 1, "type": type, "sessionID": id, "epoch": epoch, "sequence": sequence]
         let event: [String: Any] = ["id": eventID, "role": "tool-progress", "tool": "rlm.infer", "text": text]

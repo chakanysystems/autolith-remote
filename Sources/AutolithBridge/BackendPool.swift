@@ -24,6 +24,7 @@ final class BackendPool: @unchecked Sendable {
     private var endpoints: [String: String]
     private var gatewayID: String?
     private var listSnapshot: (data: Data, expires: TimeInterval)?
+    private let projections = TranscriptProjectionCache()
 
     init(socketPath: String, tokenPath: String, mappingFile: URL) throws {
         self.socketPath = socketPath; self.tokenPath = tokenPath; self.mappingFile = mappingFile
@@ -56,11 +57,39 @@ final class BackendPool: @unchecked Sendable {
     }
 
     func call(_ request: Data, context: BackendRequestContext = BackendRequestContext()) throws -> Data {
+        if let object = try JSONSerialization.jsonObject(with: request) as? [String: Any],
+           object["operation"] as? String == "transcript", let id = object["id"] as? String,
+           (object["after"] as? Int ?? 0) == 0 {
+            return try projections.load(sessionID: id, context: context,
+                source: { try self.transcriptRevision(id, context: context) },
+                fetch: { try self.perform(request, context: context) })
+        }
+        return try perform(request, context: context)
+    }
+
+    func transcriptRevision(_ id: String, context: BackendRequestContext) throws -> String {
+        try TranscriptSource.revision(transcriptSource(id, context: context))
+    }
+
+    func watchSnapshot(_ id: String, context: BackendRequestContext) throws -> [String: Any] {
+        let source = try transcriptSource(id, context: context)
+        guard let status = source["status"] as? [String: Any] else { throw BridgeError.invalid("Session is no longer available.") }
+        return ["status": status, "transcriptRevision": try TranscriptSource.revision(source)]
+    }
+
+    private func transcriptSource(_ id: String, context: BackendRequestContext) throws -> [String: Any] {
+        let data = try perform(JSONSerialization.data(withJSONObject: ["operation": "transcript-source", "id": id]), context: context)
+        guard let source = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw BridgeError.invalid("Invalid transcript source.") }
+        if let error = source["error"] as? String { throw BridgeError.invalid(error) }
+        return source
+    }
+
+    private func perform(_ request: Data, context: BackendRequestContext) throws -> Data {
         try context.check()
         guard request.count <= 262144,
               var object = try JSONSerialization.jsonObject(with: request) as? [String: Any],
               let operation = object["operation"] as? String,
-              ["list", "create", "resume", "transcript", "catalog", "tell", "pause", "kill", "delete"].contains(operation) else {
+              ["list", "create", "resume", "transcript", "transcript-source", "catalog", "tell", "pause", "kill", "delete"].contains(operation) else {
             throw BridgeError.invalid("Unsupported management operation.")
         }
         object.removeValue(forKey: "managementSocket")
@@ -72,7 +101,7 @@ final class BackendPool: @unchecked Sendable {
         lock.unlock()
         guard id == nil || id != reserved else { throw BridgeError.invalid("The companion's gateway session is reserved for management.") }
         var path = socketPath
-        if ["catalog", "transcript", "tell", "pause"].contains(operation), let endpoint,
+        if ["catalog", "transcript", "transcript-source", "tell", "pause"].contains(operation), let endpoint,
            FileManager.default.fileExists(atPath: endpoint) {
             path = endpoint
             object["requireCurrent"] = true
@@ -87,7 +116,7 @@ final class BackendPool: @unchecked Sendable {
             }
             object["managementSocket"] = newSocket!
         }
-        let mutation = !["list", "catalog", "transcript"].contains(operation)
+        let mutation = !["list", "catalog", "transcript", "transcript-source"].contains(operation)
         if mutation { invalidateList() }
         defer { if mutation { invalidateList() } }
         return try withEndpoint(path, context: context) { connection in

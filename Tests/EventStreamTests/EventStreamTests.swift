@@ -178,7 +178,9 @@ final class EventStreamTests: XCTestCase {
                     do { form = try server.receive(socket) } catch { return }
                     let request = try ManagementTestServer.request(form)
                     if request["operation"] as? String == "identity" { try server.reply(socket, ["id": "gateway"]) }
-                    else { try server.reply(socket, ["sessions": [["id": "s", "state": "idle"]]]) }
+                    else if request["operation"] as? String == "transcript-source" {
+                        try server.reply(socket, ["files": [], "context": [], "status": ["id": "s", "state": "idle"]])
+                    } else { try server.reply(socket, ["sessions": [["id": "s", "state": "idle"]]]) }
                 }
             }
             // Use this test run's product, including custom SwiftPM scratch paths.

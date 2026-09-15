@@ -53,6 +53,13 @@ public final class MessageOutbox: @unchecked Sendable {
     // Lowered by focused capacity tests; production uses the fixed admission budget.
     var admissionByteBudget = MessageOutbox.admissionByteLimit
     private var needsDurabilityConfirmation = false
+    private var changeIdentifier = UUID().uuidString
+
+    /// Change only after a durable outbox or read-state transition.
+    public var revision: String {
+        lock.lock(); defer { lock.unlock() }
+        return changeIdentifier
+    }
 
     public init(file: URL, now: Double = Date().timeIntervalSince1970) throws {
         self.file = file
@@ -75,6 +82,7 @@ public final class MessageOutbox: @unchecked Sendable {
         let data = try JSONEncoder().encode(storage)
         guard data.count <= Self.byteLimit else { throw BridgeError.invalid("Outbox byte budget exhausted.") }
         try persist(data, file)
+        changeIdentifier = UUID().uuidString
     }
 
     private func checkAdmission() throws {
