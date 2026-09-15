@@ -29,7 +29,7 @@ enum SiriConversationMemory {
         var errorDescription: String? {
             switch self {
             case .resumeUnconfirmed(let id): "Could not confirm that conversation \(id) resumed. Check it in Autolith before retrying."
-            case .wrongConversation: "The Mac returned a different conversation while resuming. No follow-up was sent."
+            case .wrongConversation: "The computer returned a different conversation while resuming. No follow-up was sent."
             case .deliveryUnconfirmed(let id): "Could not confirm delivery to conversation \(id). Check it in Autolith before sending the follow-up again."
             }
         }

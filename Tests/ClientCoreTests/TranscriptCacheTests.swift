@@ -59,8 +59,8 @@ final class TranscriptCacheTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let cache = TranscriptCache(directory: directory)
-        let key = TranscriptCache.key(host: "https://mac.example", token: "secret")
-        let other = TranscriptCache.key(host: "https://mac.example", token: "changed")
+        let key = TranscriptCache.key(host: "https://computer.example", token: "secret")
+        let other = TranscriptCache.key(host: "https://computer.example", token: "changed")
         XCTAssertNotEqual(key, other)
         let session = Session(id: "s", title: "Fixture", state: "idle", workspace: "/fixture", model: "test", permissions: "ask", queued: 0, jobs: 0, updatedAt: nil)
         let transcript = CachedTranscript(revision: "a", events: [event("1", "hello")], accessed: Date())

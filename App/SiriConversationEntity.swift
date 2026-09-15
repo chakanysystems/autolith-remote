@@ -273,7 +273,7 @@ struct AutolithConversationQuery: EntityStringQuery, IndexedEntityQuery {
         } catch { UserDefaults.standard.set(error.localizedDescription, forKey: "siriContextError") }
     }
 
-    // Use the successful list response to retire deleted conversations and old Mac entries.
+    // Use the successful list response to retire deleted conversations and old computer entries.
     static func retireUnavailable(connection: Connection) async {
         let host = connection.host
         let valid = Set(connection.sessions.map { host + "#" + $0.id })

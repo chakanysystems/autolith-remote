@@ -61,7 +61,7 @@ struct AutolithSessionEntity: AppEntity {
     }
     static func requireHost(_ host: String, connection: Connection) throws {
         guard CompanionEndpoint.equivalent(host, connection.host) else {
-            throw connection.failure("This selection belongs to a different Mac. Choose a workspace or session from the connected Mac.")
+            throw connection.failure("This selection belongs to a different computer. Choose a workspace or session from the connected computer.")
         }
     }
 }

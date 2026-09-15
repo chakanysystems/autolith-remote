@@ -8,7 +8,7 @@ struct ConnectionStatusView: View {
     @State private var showingDetails = false
 
     private var status: String {
-        online ? "Mac connected" : refreshing ? "Connecting…" : "Disconnected"
+        online ? "Computer connected" : refreshing ? "Connecting…" : "Disconnected"
     }
 
     var body: some View {

@@ -20,7 +20,7 @@ struct SiriWorkspaceSettings: View {
                     Label(defaultPath.isEmpty ? "Ask each time" : defaultPath, systemImage: "folder")
                 }
                 if !defaultPath.isEmpty { Button("Ask each time") { defaultPath = "" } }
-                Text("When your request does not name a workspace, Siri uses this folder on the connected Mac.")
+                Text("When your request does not name a workspace, Siri uses this folder on the connected computer.")
             }
             Section("Workspace nicknames") {
                 ForEach(visiblePaths, id: \.self) { path in

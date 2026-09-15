@@ -83,7 +83,7 @@ struct SessionComposer: View {
             .font(.caption).foregroundStyle(.secondary).buttonStyle(.plain)
             .disabled(!session.isRunning || !connection.online || connection.busy)
             if lisp {
-                Label("Lisp runs in this session on your Mac", systemImage: "terminal").font(.caption).foregroundStyle(.secondary)
+                Label("Lisp runs in this session on your computer", systemImage: "terminal").font(.caption).foregroundStyle(.secondary)
             }
         }.padding(.horizontal, 16).padding(.vertical, 8).frame(maxWidth: 900).frame(maxWidth: .infinity)
             .onAppear { selection = NSRange(location: (draft as NSString).length, length: 0) }

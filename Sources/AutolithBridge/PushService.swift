@@ -10,7 +10,7 @@ import FoundationNetworking
 import ClientCore
 import BridgeCore
 
-// Push credentials stay on the Mac. The only outbound destinations are Apple's APNs hosts.
+// Push credentials stay on the computer. The only outbound destinations are Apple's APNs hosts.
 final class PushService: @unchecked Sendable {
     private struct Registration {
         let token: String
@@ -66,7 +66,7 @@ final class PushService: @unchecked Sendable {
         }
     }
     func register(_ object: [String: Any], beforeMutation: () throws -> Void = {}) throws {
-        guard enabled else { throw NSError(domain: "AutolithPush", code: 3, userInfo: [NSLocalizedDescriptionKey: "APNs is not configured on this Mac."]) }
+        guard enabled else { throw NSError(domain: "AutolithPush", code: 3, userInfo: [NSLocalizedDescriptionKey: "APNs is not configured on this computer."]) }
         guard let id = object["activityId"] as? String, !id.isEmpty, id.count <= 128,
               let token = object["pushToken"] as? String, (32...512).contains(token.count),
               token.count.isMultiple(of: 2), token.allSatisfy({ $0.isHexDigit && $0.isASCII }) else {

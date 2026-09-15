@@ -11,7 +11,7 @@ struct ReadLatestAutolithResponseIntent: AppIntent {
         let (connection, sessions) = try await SiriSessionService.sessions()
         guard let id = SiriConversationMemory.lastSentIdentifier(host: connection.host) ?? SiriConversationMemory.identifier(host: connection.host),
               let session = sessions.first(where: { $0.id == id }) else {
-            throw connection.failure("Send Autolith a question first. The last requested conversation is not available on this Mac.")
+            throw connection.failure("Send Autolith a question first. The last requested conversation is not available on this computer.")
         }
         SiriTrace.record("Read latest: last requested conversation", sessionID: id)
         var intent = ReadAutolithMessageIntent()
@@ -47,7 +47,7 @@ struct ReadAutolithMessageIntent: AppIntent {
         if let offset = events.firstIndex(where: { $0.id == answer.id }) { events[offset] = answer }
         let entity = AutolithConversationEntity(session: selected, host: connection.host, events: events)
         guard let message = AutolithMessageEntity(event: answer, conversation: entity) else {
-            throw connection.failure("This response has no durable message date. Update the Mac companion backend before using message retrieval.")
+            throw connection.failure("This response has no durable message date. Update the computer companion backend before using message retrieval.")
         }
         await AutolithConversationContext.remember(entity)
         await SiriMessageMaintenance.update(host: connection.host, sessionID: selected.id) {

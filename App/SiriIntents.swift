@@ -5,7 +5,7 @@ struct AskAutolithIntent: AppIntent {
     static var title: LocalizedStringResource = "Ask Autolith"
     static var description = IntentDescription("Send a question to a new session in a known workspace. Work continues in the background after this action finishes.")
     static var authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
-    @Parameter(title: "Workspace", requestValueDialog: "Which Mac workspace should I use?") var workspace: AutolithWorkspaceEntity?
+    @Parameter(title: "Workspace", requestValueDialog: "Which computer workspace should I use?") var workspace: AutolithWorkspaceEntity?
     @Parameter(title: "Question") var question: String?
     static var parameterSummary: some ParameterSummary { Summary("Ask Autolith \(\.$question) in \(\.$workspace)") }
 
@@ -43,7 +43,7 @@ struct AskAutolithIntent: AppIntent {
             else { selected = try await $workspace.requestDisambiguation(among: matches.isEmpty ? choices : matches, dialog: "Which workspace should run this request?") }
         }
         guard let id = try await connection.call(["operation": "create", "workspace": selected.path, "permissions": "ask"]).id else {
-            throw connection.failure("The Mac did not return a session identifier.")
+            throw connection.failure("The computer did not return a session identifier.")
         }
         do {
             _ = try await connection.call(["operation": "tell", "id": id, "message": message])
@@ -82,7 +82,7 @@ struct ReadAutolithAnswerIntent: AppIntent {
             id = latest.id
         } else {
             guard let latest = SiriConversationMemory.identifier(host: connection.host) else {
-                throw connection.failure("No Siri question has been sent to this Mac yet. Choose a session or ask Autolith a question first.")
+                throw connection.failure("No Siri question has been sent to this computer yet. Choose a session or ask Autolith a question first.")
             }
             id = latest
         }

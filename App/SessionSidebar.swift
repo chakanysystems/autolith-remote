@@ -77,7 +77,7 @@ struct SessionSidebar: View {
         .refreshable { await connection.refresh() }
         .overlay {
             if connection.sessions.isEmpty {
-                ContentUnavailableView("Your sessions", systemImage: "sidebar.left", description: Text(connection.online ? "Create a session to start working on your Mac." : "Connect your Mac in Settings to see its sessions."))
+                ContentUnavailableView("Your sessions", systemImage: "sidebar.left", description: Text(connection.online ? "Create a session to start working on your computer." : "Connect your computer in Settings to see its sessions."))
             }
         }
     }

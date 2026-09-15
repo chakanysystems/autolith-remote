@@ -21,7 +21,7 @@ struct WorkspacePicker: View {
                     }
                 }
             }
-            Section("Folders on your Mac") {
+            Section("Folders on your computer") {
                 ForEach(folders, id: \.self) { path in
                     Button { Task { await load(path) } } label: {
                         Label(URL(fileURLWithPath: path).lastPathComponent, systemImage: "folder")
@@ -43,7 +43,7 @@ struct WorkspacePicker: View {
             if let path { request["path"] = path }
             let reply = try await connection.call(request)
             guard let current = reply.directory, let children = reply.directories else {
-                throw connection.failure("Update the Mac companion to browse folders.")
+                throw connection.failure("Update the computer companion to browse folders.")
             }
             directory = current; folders = children
         } catch { self.error = error.localizedDescription }
