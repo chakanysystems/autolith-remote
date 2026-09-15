@@ -21,7 +21,7 @@ Connect Tailscale on the Mac and iPad. In the app, enter your Mac's Tailscale HT
 ## Companion bridge
 
 Run the bridge on macOS 14+ or Linux with glibc 2.34+. It uses SwiftNIO for loopback TCP, bounded HTTP/WebSocket parsers, and Swift Crypto on Linux. Run the backend on the same host. For a non-Nix build, install a Swift 5.10-compatible toolchain with Clang and Foundation/Dispatch libraries.
-The companion connects to Autolith's existing HMAC-authenticated management REPL over a private Unix socket. It sends bounded lexical Lisp requests that call existing session and replay functions. It does not require `autolith mobile`, a patched harness, or a new iPhone/iPad app. Use Autolith 0.49.0 or newer. Requests with uncertain delivery are never automatically replayed.
+The companion connects to Autolith's HMAC-authenticated management REPL over a private Unix socket. It sends bounded lexical Lisp requests that call session and replay functions. Use Autolith 0.49.0 or newer. Requests with uncertain delivery are never automatically replayed.
 
 1. Install Autolith 0.49.0 or newer on `PATH`. To use a specific build, set `AUTOLITH_EXECUTABLE` to its absolute path.
 2. Build the companion with `swift build -c release`, or install it with Nix below. When copying a SwiftPM build, include `AutolithCompanion_AutolithBridge.bundle` on macOS or `AutolithCompanion_AutolithBridge.resources` on Linux beside the executable.
@@ -29,7 +29,7 @@ The companion connects to Autolith's existing HMAC-authenticated management REPL
 4. Start the bridge:
 
    ```sh
-   export AUTOLITH_BRIDGE_TOKEN_FILE="$HOME/.local/state/autolith-mobile/token"
+   export AUTOLITH_BRIDGE_TOKEN_FILE="$HOME/.local/state/autolith-bridge/token"
    autolith-bridge
    ```
 
@@ -58,7 +58,7 @@ The flake exports `autolith-bridge` as both a package and a command-line app, wi
 Enable Nix's `nix-command` and `flakes` features. Set up the backend and private token file as described above, then run:
 
 ```sh
-export AUTOLITH_BRIDGE_TOKEN_FILE="$HOME/.local/state/autolith-mobile/token"
+export AUTOLITH_BRIDGE_TOKEN_FILE="$HOME/.local/state/autolith-bridge/token"
 nix run github:chakanysystems/autolith-remote#autolith-bridge
 ```
 
