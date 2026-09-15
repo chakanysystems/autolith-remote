@@ -1,4 +1,4 @@
-# Autolith for iPad
+# Autolith for iOS
 
 A native SwiftUI client for Autolith on your computer, with iPad sidebar navigation, live session status, search, durable conversation history, tool details, message drafts, and create/pause/stop controls. It also supports iPhone. Requires iOS 18 or later.
 
@@ -10,15 +10,15 @@ On the backend host, install Autolith 0.49.0 or newer and configure your provide
 
 Install into your user profile with [`nix profile add`](https://nix.dev/manual/nix/2.30/command-ref/new-cli/nix3-profile-add.html):
 
-\```sh
+```sh
 nix profile add github:chakanysystems/autolith-remote#autolith-bridge
-\```
+```
 
 ### 2. Start it
 
-\```sh
+```sh
 autolith-bridge
-\```
+```
 
 On first launch, the bridge generates a random companion token and prints its file location. By default, it uses `$HOME/.local/state/autolith-bridge/token`, or `$XDG_STATE_HOME/autolith-bridge/token` when `XDG_STATE_HOME` is set. It reuses the token on later launches. The token file has mode 0600 inside a private mode-0700 directory.
 
@@ -28,9 +28,9 @@ The bridge also creates its separate management credentials and starts Autolith.
 
 In another terminal, expose the loopback listener through [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve):
 
-\```sh
+```sh
 tailscale serve --bg http://127.0.0.1:4318
-\```
+```
 
 Copy the HTTPS address printed by Tailscale into the app's server address field. Open the token file at the location printed by the bridge and paste its contents into the app's token field. Connect from the app to view and create sessions.
 
@@ -83,9 +83,9 @@ The flake exports `autolith-bridge` as both a package and a command-line app, wi
 
 To run without installing into your profile:
 
-\```sh
+```sh
 nix run github:chakanysystems/autolith-remote#autolith-bridge
-\```
+```
 
 From a local checkout, use `nix run .`, `nix build .`, or `nix flake check`. Linux builds run the full Swift test suite. Every build checks startup of the installed executable without injected library paths. Run the macOS suite with Xcode's `swift test`; Nix's Darwin SwiftPM lacks Apple's XCTest runner. `nix build` puts the executable at `result/bin/autolith-bridge`.
 
