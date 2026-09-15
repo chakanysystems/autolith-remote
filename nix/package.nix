@@ -46,7 +46,7 @@ stdenv.mkDerivation {
     description = "Local bridge between the Autolith mobile client and backend";
     homepage = "https://github.com/chakanysystems/autolith-remote";
     license = lib.licenses.asl20;
-    platforms = lib.platforms.darwin;
+    platforms = [ "aarch64-darwin" "x86_64-linux" ];
     mainProgram = "autolith-bridge";
   };
 }
