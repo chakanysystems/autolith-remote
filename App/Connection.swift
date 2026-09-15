@@ -205,7 +205,11 @@ struct Reply: Codable, Sendable {
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
         let (data, response) = try await BoundedHTTP.data(for: request, limit: BoundedHTTP.limit(operation: payload["operation"] as? String ?? ""))
         guard response.statusCode == 200 else { throw failure("The computer companion rejected the request (\(response.statusCode)).") }
-        let reply = try await BackgroundWork.run { try JSONDecoder().decode(Reply.self, from: data) }
+        let reply = try await BackgroundWork.run {
+            let interval = PerformanceInterval(.decoding)
+            defer { interval.finish(bytes: data.count) }
+            return try JSONDecoder().decode(Reply.self, from: data)
+        }
         if let message = reply.error { throw failure(message) }
         return reply
     }
@@ -287,8 +291,10 @@ struct Reply: Codable, Sendable {
                     prepared = try await Self.prepareTranscript(snapshot, reply: reply)
                 }
                 guard !Task.isCancelled, self.generation == generation, self.sessionEpochs[id] == epoch else { return }
+                let publication = PerformanceInterval(.publication)
                 self.cached[id] = prepared.snapshot
                 if prepared.changed || self.events[id] == nil { self.events[id] = prepared.snapshot.events; self.scheduleMaintenance() }
+                publication.finish()
                 self.transcriptRefreshedAt[id] = Date()
                 self.trimCache()
                 if prepared.changed || snapshot.revision != prepared.snapshot.revision { self.persistCache() }
@@ -302,6 +308,8 @@ struct Reply: Codable, Sendable {
 
     nonisolated private static func prepareTranscript(_ original: CachedTranscript, reply: Reply) async throws -> (snapshot: CachedTranscript, changed: Bool) {
         try await BackgroundWork.run {
+            let interval = PerformanceInterval(.reconciliation)
+            defer { interval.finish() }
             guard let revision = reply.revision else { throw CachedTranscript.CacheError.invalidRevision }
             var snapshot = original
             try snapshot.reconcile(revision: revision, base: reply.baseRevision, order: reply.eventOrder,

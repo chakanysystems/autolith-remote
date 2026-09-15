@@ -48,6 +48,8 @@ public enum BoundedHTTP {
     }
 
     public static func data(for request: URLRequest, limit: Int) async throws -> (Data, HTTPURLResponse) {
+        let interval = PerformanceInterval(.http)
+        defer { interval.finish() }
         let transfer = BoundedHTTPTransfer(limit: limit)
         return try await withTaskCancellationHandler {
             try Task.checkCancellation()

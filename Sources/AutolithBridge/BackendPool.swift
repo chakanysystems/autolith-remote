@@ -1,5 +1,6 @@
 import Foundation
 import BridgeCore
+import ClientCore
 #if canImport(Darwin)
 import Darwin
 #else
@@ -177,6 +178,8 @@ final class BackendPool: @unchecked Sendable {
     }
 
     private func acquire(_ slot: DispatchSemaphore, context: BackendRequestContext) throws {
+        let interval = PerformanceInterval(.backendWait)
+        defer { interval.finish() }
         while true {
             try context.check()
             if slot.wait(timeout: min(context.deadline, .now() + 0.05)) == .success {
@@ -192,6 +195,8 @@ final class BackendPool: @unchecked Sendable {
     }
 
     private func exchange(_ request: [String: Any], connection: ManagementRPC, context: BackendRequestContext) throws -> [String: Any] {
+        let interval = PerformanceInterval(.backendRPC)
+        defer { interval.finish() }
         let json = String(decoding: try JSONSerialization.data(withJSONObject: request), as: UTF8.self)
         let source = template.replacingOccurrences(of: "__REQUEST_JSON__", with: ManagementForm.quote(json))
         let values = try connection.evaluate(source, context: context)

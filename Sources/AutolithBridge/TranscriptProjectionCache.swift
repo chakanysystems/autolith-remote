@@ -1,5 +1,6 @@
 import Foundation
 import BridgeCore
+import ClientCore
 #if canImport(Darwin)
 import Darwin
 #else
@@ -14,6 +15,8 @@ import Crypto
 /// Fingerprint every replay segment and live local operation, without reading history.
 enum TranscriptSource {
     static func revision(_ source: [String: Any]) throws -> String {
+        let interval = PerformanceInterval(.transcriptSource)
+        defer { interval.finish() }
         guard let paths = source["files"] as? [String], let context = source["context"] as? [Any] else {
             throw BridgeError.invalid("Management endpoint did not describe transcript storage.")
         }
@@ -70,7 +73,9 @@ final class TranscriptProjectionCache: @unchecked Sendable {
         try context.check()
         let before = try source()
         if entry.source == before, let data = entry.data { return data }
+        let interval = PerformanceInterval(.transcriptRead)
         let data = try fetch()
+        interval.finish(bytes: data.count)
         guard let reply = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               reply["error"] == nil, reply["events"] is [[String: Any]] else { return data }
         let after = try source()

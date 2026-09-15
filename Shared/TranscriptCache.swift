@@ -128,6 +128,8 @@ actor TranscriptCache {
         return snapshot
     }
     func save(_ snapshot: Snapshot, key: String) throws {
+        let interval = PerformanceInterval(.cacheWrite)
+        defer { interval.finish() }
         guard activeKey == nil || activeKey == key else { throw CancellationError() }
         try Task.checkCancellation()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
