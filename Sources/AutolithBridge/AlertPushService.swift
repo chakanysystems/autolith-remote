@@ -77,7 +77,7 @@ final class AlertPushService: @unchecked Sendable {
         if startTimer {
             let timer = DispatchSource.makeTimerSource(queue: queue)
             timer.schedule(deadline: .now() + 5, repeating: 10)
-            timer.setEventHandler { [weak self] in Task { await self?.pollOnce() } }
+            timer.setEventHandler { [weak self] in Task { [weak self] in await self?.pollOnce() } }
             self.timer = timer; timer.resume()
         }
     }

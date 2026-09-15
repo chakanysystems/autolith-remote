@@ -54,7 +54,7 @@ final class PushService: @unchecked Sendable {
         if enabled {
             let timer = DispatchSource.makeTimerSource(queue: queue)
             timer.schedule(deadline: .now() + 5, repeating: 15)
-            timer.setEventHandler { [weak self] in Task { await self?.pollOnce() } }
+            timer.setEventHandler { [weak self] in Task { [weak self] in await self?.pollOnce() } }
             timer.resume(); self.timer = timer
         }
     }
