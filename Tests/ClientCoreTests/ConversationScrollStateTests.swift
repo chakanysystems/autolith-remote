@@ -2,6 +2,14 @@ import XCTest
 @testable import ClientCore
 
 final class ConversationScrollStateTests: XCTestCase {
+    func testLatestButtonRestoresFollowingAfterReadingHistory() {
+        var state = ConversationScrollState()
+        state.userScrollChanged(active: true, distanceFromBottom: 1000)
+        state.userScrollChanged(active: false, distanceFromBottom: 1000)
+        XCTAssertFalse(state.shouldFollow)
+        state.requestLatest()
+        XCTAssertTrue(state.shouldFollow)
+    }
     func testLargeReplyDoesNotDisableFollowingAtBottom() {
         var state = ConversationScrollState()
         state.geometryChanged(distanceFromBottom: 0)

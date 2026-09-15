@@ -6,6 +6,11 @@ struct ConversationScrollState {
     private(set) var userIsScrolling = false
     var shouldFollow: Bool { followsLatest && !userIsScrolling }
 
+    mutating func requestLatest() {
+        followsLatest = true
+        userIsScrolling = false
+    }
+
     mutating func geometryChanged(distanceFromBottom: Double) {
         if userIsScrolling { followsLatest = distanceFromBottom <= 64 }
     }

@@ -85,6 +85,7 @@ struct ConversationView: View {
     let session: Session
     @State private var stopping = false
     @State private var history = ConversationHistoryWindow()
+    @State private var latestRequest = 0
     private var eventIDs: [String] { connection.eventIdentifiers(for: session.id) }
     private var historyStart: Int { history.startIndex(in: eventIDs) }
     private var historyRange: Range<Int> { history.range(in: eventIDs) }
@@ -118,12 +119,15 @@ struct ConversationView: View {
                 }
                 if historyRange.upperBound < eventIDs.count {
                     HStack {
-                        Button("Show newer messages") { history.showNewer(eventIDs) }
+                        Button("Show newer messages") {
+                            history.showNewer(eventIDs)
+                            if history.followsLatest { latestRequest += 1 }
+                        }
                         Spacer()
-                        Button("Latest messages") { history.showLatest(eventIDs) }
+                        Button("Latest messages") { history.showLatest(eventIDs); latestRequest += 1 }
                     }.font(.callout)
                 }
-            }, followingChanged: { history.setFollowing($0, ids: eventIDs) })
+            }, followingChanged: { history.setFollowing($0, ids: eventIDs) }, latestRequest: latestRequest)
             SessionComposer(connection: connection, session: session)
         }
         .navigationTitle(session.title).navigationBarTitleDisplayMode(.inline)
