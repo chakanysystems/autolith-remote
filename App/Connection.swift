@@ -345,13 +345,18 @@ struct Reply: Codable, Sendable {
                     let batch = Array((readQueue[id] ?? []).prefix(100))
                     let reply = try await call(["operation": "messages-read", "id": id, "eventIDs": batch])
                     guard !Task.isCancelled, self.generation == generation else { return }
-                    guard reply.ok == true, reply.readIDs != nil else { throw failure("Read receipts were not confirmed.") }
+                    guard reply.ok == true, let confirmed = reply.readIDs else { throw failure("Read receipts were not confirmed.") }
                     readQueue[id]?.subtract(batch)
                     if readQueue[id]?.isEmpty == true { readQueue[id] = nil }
                     // Finish any pre-acknowledgment fetch before reconciling read state.
                     if let pending = fetches[id] { await pending.value }
                     guard !Task.isCancelled, self.generation == generation else { return }
-                    await loadTranscript(id)
+                    if var snapshot = cached[id], snapshot.confirmRead(Set(confirmed).intersection(batch)) {
+                        cached[id] = snapshot
+                        events[id] = snapshot.events
+                        persistCache()
+                        scheduleMaintenance()
+                    }
                 }
             } catch { if !Task.isCancelled { UserDefaults.standard.set(error.localizedDescription, forKey: "readReceiptError") } }
         }

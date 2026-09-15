@@ -16,6 +16,18 @@ struct CachedTranscript: Codable, Sendable {
     static let memoryLimit = 16 * 1024 * 1024
     static let eventLimit = 10_000
 
+    /// Apply only acknowledged receipts. The next sync obtains a canonical server revision.
+    mutating func confirmRead(_ identifiers: Set<String>) -> Bool {
+        var changed = false
+        for index in events.indices where identifiers.contains(events[index].id)
+            && ["user", "assistant"].contains(events[index].role) && !events[index].hasBeenRead {
+            events[index].isRead = true
+            changed = true
+        }
+        if changed { revision = "" }
+        return changed
+    }
+
     static func validate(_ events: [Event]) throws {
         guard events.count <= eventLimit else { throw CacheError.tooLarge }
         var cost = 0
