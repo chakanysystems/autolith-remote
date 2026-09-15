@@ -23,33 +23,27 @@ Connect Tailscale on the Mac and iPad. In the app, enter your Mac's Tailscale HT
 Run the bridge on macOS 14+ or Linux with glibc 2.34+. It uses SwiftNIO for loopback TCP, bounded HTTP/WebSocket parsers, and Swift Crypto on Linux. Run the backend on the same host. For a non-Nix build, install a Swift 5.10-compatible toolchain with Clang and Foundation/Dispatch libraries.
 The companion connects to Autolith's existing HMAC-authenticated management REPL over a private Unix socket. It sends bounded lexical Lisp requests that call existing session and replay functions. It does not require `autolith mobile`, a patched harness, or a new iPhone/iPad app. Use Autolith 0.49.0 or newer. Requests with uncertain delivery are never automatically replayed.
 
-1. Build the companion with `swift build -c release`. Keep `AutolithCompanion_AutolithBridge.bundle` alongside the executable when copying it elsewhere.
-2. Create two separate private token files: one for the phone-facing companion and one for management RPC. Keep both in a directory owned by you with mode 0700. Each file must be owned by you with mode 0600. The companion token must contain at least 32 random characters; the management token contains 1 to 4096 raw bytes and must match exactly, including any newline.
-3. Start an ordinary, dedicated Autolith session as the gateway in one terminal:
+1. Install Autolith 0.49.0 or newer on `PATH`. To use a specific build, set `AUTOLITH_EXECUTABLE` to its absolute path.
+2. Build the companion with `swift build -c release`, or install it with Nix below. When copying a SwiftPM build, include `AutolithCompanion_AutolithBridge.bundle` on macOS or `AutolithCompanion_AutolithBridge.resources` on Linux beside the executable.
+3. Set `AUTOLITH_BRIDGE_TOKEN_FILE` to your existing phone-facing token: an owned mode-0600 file containing at least 32 random characters, inside an owned mode-0700 directory.
+4. Start the bridge:
 
    ```sh
-   export AUTOLITH_MANAGEMENT_REPL=on
-   export AUTOLITH_MANAGEMENT_REPL_TRANSPORT=unix
-   export AUTOLITH_MANAGEMENT_REPL_UNIX_SOCKET="$HOME/.local/state/autolith-mobile/rpc/gateway.sock"
-   export AUTOLITH_MANAGEMENT_REPL_TOKEN_FILE="$HOME/.local/state/autolith-mobile/management-token"
-   export AUTOLITH_MANAGEMENT_REPL_TIMEOUT=60
-   export AUTOLITH_MANAGEMENT_REPL_MAX_OUTPUT=8388608
-   export AUTOLITH_MANAGEMENT_REPL_MAX_FRAME=33554432
-   AUTOLITH_SESSION_STYLE=direct autolith --permissions ask
-   ```
-
-   Keep this dedicated gateway running. It is hidden from the phone's session list. Management RPC evaluates trusted Lisp with the host user's privileges. Store its token on the host; do not give it to the phone or expose the socket through Tailscale. The larger bounded output limit accommodates conversation history. A response exceeding the limit fails explicitly.
-4. Start the companion in another terminal, using the same socket and management-token paths:
-
-   ```sh
-   export AUTOLITH_MANAGEMENT_REPL_UNIX_SOCKET="$HOME/.local/state/autolith-mobile/rpc/gateway.sock"
-   export AUTOLITH_MANAGEMENT_REPL_TOKEN_FILE="$HOME/.local/state/autolith-mobile/management-token"
    export AUTOLITH_BRIDGE_TOKEN_FILE="$HOME/.local/state/autolith-mobile/token"
-   .build/release/autolith-bridge
+   autolith-bridge
    ```
 
-   Startup verifies the authenticated gateway connection. New sessions inherit the gateway's installed Autolith build and management settings, with an individual private socket. The companion saves their endpoint inventory next to its token so restarting the companion does not lose their live transcript access. Do not delete that inventory while sessions are running.
-5. Run `tailscale serve --bg http://127.0.0.1:4318`. Keep the existing HTTPS address and companion token in the phone app.
+The bridge creates a separate management token and starts a dedicated Autolith process. It waits up to 30 seconds for an authenticated connection before opening the HTTP listener. The management files are stored in `gateway/` beside the companion token. Keep that directory and `management-endpoints.json` to retain access to running sessions across bridge restarts.
+
+On Ctrl-C, SIGTERM, or SIGHUP, the bridge stops only the gateway process group it started. Sessions created through the app run separately. If the gateway exits, the bridge exits with an error instead of replaying requests or restarting it silently.
+
+Run `tailscale serve --bg http://127.0.0.1:4318`. Keep the existing HTTPS address and companion token in the phone app.
+
+### Use an existing management REPL
+
+Set both `AUTOLITH_MANAGEMENT_REPL_UNIX_SOCKET` and `AUTOLITH_MANAGEMENT_REPL_TOKEN_FILE` to connect to an existing gateway. In this mode, the bridge does not start or stop Autolith. To return to automatic startup, unset both variables.
+
+Management RPC evaluates trusted Lisp with the host user's privileges. Keep its token on the host and separate from the phone-facing token. The bridge starts its gateway with Unix transport, a 60-second evaluation limit, an 8 MiB output limit, and a 32 MiB frame limit.
 
 Live status and durable transcripts refresh through polling. This backend does not install token-streaming hooks or automatically stop idle sessions. Stop remains available explicitly in the app, and saved history remains available for Resume.
 
@@ -64,13 +58,11 @@ The flake exports `autolith-bridge` as both a package and a command-line app, wi
 Enable Nix's `nix-command` and `flakes` features. Set up the backend and private token file as described above, then run:
 
 ```sh
-export AUTOLITH_MANAGEMENT_REPL_UNIX_SOCKET="$HOME/.local/state/autolith-mobile/rpc/gateway.sock"
-export AUTOLITH_MANAGEMENT_REPL_TOKEN_FILE="$HOME/.local/state/autolith-mobile/management-token"
 export AUTOLITH_BRIDGE_TOKEN_FILE="$HOME/.local/state/autolith-mobile/token"
 nix run github:chakanysystems/autolith-remote#autolith-bridge
 ```
 
-The bridge runs in the foreground. Run Tailscale Serve as described above to connect the mobile client. The management gateway must already be running. Socket, token, and optional APNs settings are supplied at runtime.
+The bridge runs in the foreground and starts its own management gateway. Install the Autolith backend separately. Run Tailscale Serve as described above to connect the mobile client.
 
 To install the bridge into your Nix profile:
 
@@ -83,7 +75,7 @@ From a local checkout, use `nix run .`, `nix build .`, or `nix flake check`. Lin
 
 `flake.lock` pins the build tools. `Package.swift` and `Package.resolved` pin Swift 5.10-compatible dependencies; `nix/dependencies` contains their fixed hashes and offline SwiftPM workspace metadata. When updating dependencies, resolve the package graph and regenerate that metadata with the pinned `swiftpm2nix`, then test both platforms.
 
-Other flakes can use `inputs.autolith-remote.packages.${system}.autolith-bridge`. The derivation in `nix/package.nix` can also be used with `pkgs.callPackage`. To start the installed bridge at login, use a per-user launchd agent on macOS or systemd user service on Linux. Supply absolute socket and token paths in its environment.
+Other flakes can use `inputs.autolith-remote.packages.${system}.autolith-bridge`. The derivation in `nix/package.nix` can also be used with `pkgs.callPackage`. To start the installed bridge at login, use a per-user launchd agent on macOS or systemd user service on Linux. Supply the companion token path and, if needed, `AUTOLITH_EXECUTABLE` in its environment.
 
 ## Sessions and permissions
 

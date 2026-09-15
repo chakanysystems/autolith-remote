@@ -18,23 +18,17 @@ guard let tokenText = String(data: tokenData, encoding: .utf8) else {
 }
 let token = tokenText.trimmingCharacters(in: .whitespacesAndNewlines)
 guard token.utf8.count >= 32 else { fputs("Token must contain at least 32 random characters.\n", stderr); exit(64) }
-let home = FileManager.default.homeDirectoryForCurrentUser.path
-let stateHome = environment["XDG_STATE_HOME"] ?? home + "/.local/state"
-let configHome = environment["XDG_CONFIG_HOME"] ?? home + "/.config"
-let managementSocket = environment["AUTOLITH_MANAGEMENT_REPL_UNIX_SOCKET"] ?? stateHome + "/autolith/management/repl.sock"
-let managementToken = environment["AUTOLITH_MANAGEMENT_REPL_TOKEN_FILE"] ?? configHome + "/autolith/management-repl.token"
-func makeBackend() -> BackendPool {
+func makeManagedBackend() -> ManagedBackend {
     do {
-        let backend = try BackendPool(socketPath: managementSocket, tokenPath: managementToken,
-                                      mappingFile: URL(fileURLWithPath: tokenPath).deletingLastPathComponent().appendingPathComponent("management-endpoints.json"))
-        try backend.checkConnection()
-        return backend
+        return try ManagedBackend(environment: environment,
+                                  tokenDirectory: URL(fileURLWithPath: tokenPath).deletingLastPathComponent())
     } catch {
-        fputs("Cannot start management RPC companion: \(error.localizedDescription)\n", stderr)
+        fputs("Cannot configure management RPC companion: \(error.localizedDescription)\n", stderr)
         exit(69)
     }
 }
-let backend = makeBackend()
+let managedBackend = makeManagedBackend()
+let backend = managedBackend.backend
 
 let queue = DispatchQueue(label: "autolith.bridge")
 let workers = DispatchQueue(label: "autolith.operations", attributes: .concurrent)
@@ -226,8 +220,38 @@ final class Client {
         }
     }
 }
+// Serialize launch, shutdown, and child-exit checks. Child signal dispositions
+// are reset by BackendChild before exec.
+let lifecycle = DispatchQueue(label: "autolith.gateway.lifecycle")
+let startupContext = BackendRequestContext(deadline: .now() + 30)
+let shutdownSignals = [SIGTERM, SIGINT, SIGHUP].map { number -> DispatchSourceSignal in
+    signal(number, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: number, queue: .global())
+    source.setEventHandler {
+        startupContext.cancel()
+        lifecycle.async { managedBackend.stop(); exit(0) }
+    }
+    source.resume()
+    return source
+}
+do { try lifecycle.sync { try managedBackend.start(context: startupContext) } }
+catch {
+    fputs("Cannot start management RPC companion: \(error.localizedDescription)\n", stderr)
+    exit(69)
+}
+let gatewayMonitor = DispatchSource.makeTimerSource(queue: lifecycle)
+gatewayMonitor.schedule(deadline: .now() + 1, repeating: 1)
+gatewayMonitor.setEventHandler {
+    if !managedBackend.isRunning {
+        fputs("The managed Autolith backend exited. Restart the bridge.\n", stderr)
+        managedBackend.stop()
+        exit(69)
+    }
+}
+gatewayMonitor.resume()
 var admission = ConnectionAdmission()
 var clients: [UUID: Client] = [:]
+do {
 try listener.start(port: port) { connection in
     let client = Client(connection)
     if let evicted = admission.admit(client.id), let previous = clients.removeValue(forKey: evicted) {
@@ -252,6 +276,11 @@ try listener.start(port: port) { connection in
             client.fail(408, "Request deadline exceeded. A dispatched mutation may have run; check the conversation before retrying.")
         }
     }
+}
+} catch {
+    lifecycle.sync { managedBackend.stop() }
+    fputs("Cannot start companion listener: \(error.localizedDescription)\n", stderr)
+    exit(69)
 }
 print("Autolith companion listening on 127.0.0.1:\(listener.port ?? Int(port)). Expose with Tailscale Serve HTTPS.")
 dispatchMain()

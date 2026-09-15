@@ -6,6 +6,17 @@
 #include <signal.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/file.h>
+#include <sys/wait.h>
+
+int bridge_lock_exclusive(int fd) { return flock(fd, LOCK_EX | LOCK_NB); }
+
+// Observe exit without reaping: stop() must retain ownership of the process group.
+int bridge_child_running(pid_t pid) {
+    siginfo_t info = {0};
+    if (waitid(P_PID, (id_t)pid, &info, WEXITED | WNOHANG | WNOWAIT) != 0) return -1;
+    return info.si_pid == 0;
+}
 
 int bridge_prepare_reaping(void) {
     struct sigaction action = {0};

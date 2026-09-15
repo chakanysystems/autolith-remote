@@ -35,8 +35,7 @@ final class BackendPool: @unchecked Sendable {
         } else { endpoints = [:] }
     }
 
-    func checkConnection() throws {
-        let context = BackendRequestContext()
+    func checkConnection(context: BackendRequestContext = BackendRequestContext()) throws {
         try acquire(context); defer { slot.signal() }
         gatewayID = try exchange(["operation": "identity"], path: socketPath, context: context)["id"] as? String
         guard gatewayID != nil else { throw BridgeError.invalid("Management endpoint has no active Autolith session.") }
