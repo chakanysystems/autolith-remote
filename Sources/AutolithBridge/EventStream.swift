@@ -11,7 +11,10 @@ final class EventStream {
     private let executable: String
     private let onClose: () -> Void
     private var decoder = WebSocketDecoder(maximumMessageBytes: 8192)
-    private var process: Process?
+    private var process: BackendChild?
+    private var reader: DispatchSourceRead?
+    private var writer: DispatchSourceWrite?
+    private var pipeCancellation: DispatchGroup?
     private var timer: DispatchSourceTimer?
     private var subscribed = false
     private var closed = false
@@ -95,44 +98,43 @@ final class EventStream {
         sessionID = object["id"] as! String
         epoch = object["epoch"] as? String ?? ""
         subscribed = true
-        let process = Process(), input = Pipe(), output = Pipe()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = ["mobile"]
-        process.standardInput = input; process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-        try process.run()
-        self.process = process
+        let child = try BackendChild(executable: executable)
+        self.process = child
         let request = try JSONSerialization.data(withJSONObject: object) + Data([10])
-        DispatchQueue.global().async { [weak self] in
-            do { try input.fileHandleForWriting.write(contentsOf: request); try input.fileHandleForWriting.close() }
-            catch { self?.queue.async { [weak self] in self?.fail("Could not start subscription.") } }
+        let cancellation = DispatchGroup()
+        pipeCancellation = cancellation
+        let writer = DispatchSource.makeWriteSource(fileDescriptor: child.input, queue: queue)
+        var offset = 0
+        writer.setEventHandler { [weak self] in
+            guard let self, !self.closing else { return }
+            let count = request.withUnsafeBytes {
+                Darwin.write(child.input, $0.baseAddress!.advanced(by: offset), $0.count - offset)
+            }
+            if count < 0 && (errno == EAGAIN || errno == EINTR) { return }
+            guard count > 0 else { self.fail("Could not start subscription."); return }
+            offset += count
+            if offset == request.count { self.writer?.cancel(); self.writer = nil }
         }
-        // Synchronous handoff bounds data waiting outside the network send budget.
-        DispatchQueue.global().async { [weak self] in
-            defer { try? output.fileHandleForReading.close() }
+        cancellation.enter()
+        writer.setCancelHandler { child.closeInput(); cancellation.leave() }
+        self.writer = writer
+        writer.resume()
+        let reader = DispatchSource.makeReadSource(fileDescriptor: child.output, queue: queue)
+        reader.setEventHandler { [weak self] in
+            guard let self, !self.closing else { return }
             var buffer = [UInt8](repeating: 0, count: 65536)
-            while true {
-                // FileHandle.read(upToCount:) can wait to fill the buffer on pipes.
-                // POSIX read returns available bytes without waiting for the next event.
-                let count = Darwin.read(output.fileHandleForReading.fileDescriptor, &buffer, buffer.count)
-                if count < 0 && errno == EINTR { continue }
-                guard count > 0 else { break }
-                let data = Data(buffer.prefix(count))
-                guard let self else { return }
-                let keepReading = self.queue.sync { () -> Bool in
-                    guard !self.closing else { return false }
-                    self.consumeOutput(data)
-                    return !self.closing
-                }
-                if !keepReading { return }
-            }
-            self?.queue.async { [weak self] in
-                guard let self, !self.closing else { return }
-                if !self.lineBuffer.isEmpty { self.consumeLine(self.lineBuffer); self.lineBuffer.removeAll() }
-                if !self.receivedEnvelope { self.fail("Backend does not support event streaming.") }
-                else { self.finish(code: 1000, reason: "Backend stream ended") }
-            }
+            let count = Darwin.read(child.output, &buffer, buffer.count)
+            if count < 0 && (errno == EAGAIN || errno == EINTR) { return }
+            if count > 0 { self.consumeOutput(Data(buffer.prefix(count))); return }
+            if count < 0 { self.fail("Backend stream read failed."); return }
+            guard self.lineBuffer.isEmpty else { self.fail("Truncated backend stream output."); return }
+            if !self.receivedEnvelope { self.fail("Backend does not support event streaming.") }
+            else { self.finish(code: 1000, reason: "Backend stream ended") }
         }
+        cancellation.enter()
+        reader.setCancelHandler { cancellation.leave() }
+        self.reader = reader
+        reader.resume()
         queue.asyncAfter(deadline: .now() + 30) { [weak self] in
             guard let self, !self.receivedEnvelope else { return }
             self.fail("Backend did not start the event stream.")
@@ -222,12 +224,12 @@ final class EventStream {
     private func stopProcess() {
         guard let process else { return }
         self.process = nil
-        if process.isRunning {
-            process.terminate()
-            queue.asyncAfter(deadline: .now() + 2) {
-                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-            }
-        }
+        reader?.cancel(); reader = nil
+        writer?.cancel(); writer = nil
+        // Close only after dispatch has stopped using the descriptors. All I/O
+        // is nonblocking and queue-confined, so cancellation needs no thread join.
+        pipeCancellation?.notify(queue: queue) { process.stop() }
+        pipeCancellation = nil
     }
 
     func stop() {

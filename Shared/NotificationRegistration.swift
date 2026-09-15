@@ -1,4 +1,14 @@
 import Foundation
+import CryptoKit
+
+/// Shared by local requests and remote payloads. Length-framed fields avoid
+/// delimiter collisions; the SHA-256 hex value fits APNs' 64-byte collapse limit.
+public enum NotificationEventIdentity {
+    public static func id(host: String, sessionID: String, eventID: String) -> String {
+        let value = [host, sessionID, eventID].map { "\($0.utf8.count):\($0)" }.joined()
+        return SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+}
 
 /// Launch-scoped APNs state. Only a current UIApplication callback supplies a token.
 struct NotificationRegistration {
@@ -21,6 +31,17 @@ struct NotificationRegistration {
     private var generation = 0
     private var pending: [String: Request] = [:]
     private var registrations: [String: Registration] = [:]
+    private var context: ConnectionContext?
+    private var revoked = false
+
+    mutating func activate(context value: ConnectionContext) {
+        guard context != value else { return }
+        context = value
+        revoked = false
+        generation += 1
+        pending.removeAll()
+        registrations.removeAll()
+    }
 
     mutating func requestDeviceToken(enabled: Bool, now: Date) -> Bool {
         guard enabled, token == nil, !deviceRequestPending,
@@ -53,13 +74,22 @@ struct NotificationRegistration {
         registrations.removeAll()
     }
 
+    /// Invalidate in-flight accepts before revoking the previous endpoint.
+    mutating func revoke(host: String) -> String? {
+        let previous = registrations[host]?.token ?? pending[host]?.token ?? token
+        revoked = true
+        generation += 1
+        pending.removeAll()
+        registrations.removeValue(forKey: host)
+        return previous
+    }
     func usesRemoteNotifications(host: String, now: Date) -> Bool {
         guard let token, let registration = registrations[host] else { return false }
         return registration.token == token && now.timeIntervalSince(registration.date) < 3600
     }
 
     mutating func beginRemoteRegistration(host: String, now: Date) -> Request? {
-        guard !host.isEmpty, let token, pending[host] == nil,
+        guard !revoked, !host.isEmpty, let token, pending[host] == nil,
               !usesRemoteNotifications(host: host, now: now) else { return nil }
         // An expired or rejected registration must not suppress local completion alerts.
         registrations.removeValue(forKey: host)

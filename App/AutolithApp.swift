@@ -108,7 +108,10 @@ struct ConversationView: View {
                     ContentUnavailableView("Ready when you are", systemImage: "text.bubble", description: Text("Send a message to begin. Completed messages and tool activity appear here."))
                 }
                 ForEach((connection.events[session.id] ?? []).dropFirst(historyStart)) { event in
-                    ConversationEventView(event: event, presentation: connection.presentation(eventID: event.id, sessionID: session.id))
+                    ConversationEventView(event: event, presentation: connection.presentation(eventID: event.id, sessionID: session.id),
+                                          retryMessage: { outboxAction("message-retry", event: event) },
+                                          abandonMessage: { outboxAction("message-abandon", event: event) },
+                                          controlsEnabled: connection.online && !connection.busy)
                         .modifier(AutolithMessageAnnotation(connection: connection, host: connection.host, sessionID: session.id, event: event))
                         .id(event.id)
                 }
@@ -149,6 +152,10 @@ struct ConversationView: View {
         .confirmationDialog("Stop this session?", isPresented: $stopping, titleVisibility: .visible) {
             Button("Stop session", role: .destructive) { Task { _ = await connection.control("kill", id: session.id) } }
         } message: { Text("Autolith will shut down this session on your Mac. Its saved conversation remains on the Mac.") }
+    }
+    private func outboxAction(_ operation: String, event: Event) {
+        let captured = connection.context
+        Task { await connection.updateOutbox(operation, event: event, sessionID: session.id, context: captured) }
     }
     private func setPermissions(_ mode: String) {
         Task { _ = await connection.control("tell", id: session.id, message: "/permissions \(mode)") }
@@ -313,47 +320,20 @@ private struct ConnectionEditor: View {
     }
 
     private func apply() {
-        guard !applying, !connection.refreshing else { return }
-
-        do {
-            let canonicalHost = try CompanionEndpoint.canonical(host)
-            guard !token.isEmpty else {
-                throw connection.failure("Enter your companion token.")
-            }
-
-            let previousHost = connection.host
-            let previousToken = connection.token
-            let currentHost = (try? CompanionEndpoint.canonical(previousHost)) ?? previousHost
-            let changed = canonicalHost != currentHost || token != previousToken
-            host = canonicalHost
-            error = nil
-
-            if changed {
-                connection.host = canonicalHost
-                connection.token = token
-                do {
-                    try connection.save()
-                } catch {
-                    connection.host = previousHost
-                    connection.token = previousToken
-                    self.error = error.localizedDescription
-                    return
-                }
-            }
-
-            applying = true
-            connection.error = nil
-            Task {
+        guard !applying else { return }
+        applying = true
+        error = nil
+        let candidateHost = host, candidateToken = token
+        Task {
+            defer { applying = false }
+            do {
+                try await connection.apply(host: candidateHost, token: candidateToken)
+                host = connection.host
+                connection.error = nil
                 await connection.refresh()
-                applying = false
-                if connection.online {
-                    dismiss()
-                } else {
-                    error = connection.error ?? "Could not connect to the Mac."
-                }
-            }
-        } catch {
-            self.error = error.localizedDescription
+                if connection.online { dismiss() }
+                else { error = connection.error ?? "Could not connect to the Mac." }
+            } catch { self.error = error.localizedDescription }
         }
     }
 }

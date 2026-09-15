@@ -80,6 +80,52 @@ final class EventStreamTests: XCTestCase {
         }
     }
 
+    func testDisconnectKillsDescendantAfterLauncherExitsWithOpenPipe() throws {
+        let snapshot = #"{"version":1,"type":"snapshot","sessionID":"s","epoch":"e","sequence":0,"status":{"id":"s"},"activity":[]}"#
+        let fixture = try Fixture(script: "read -r request\n/bin/sleep 30 &\necho $! > \"$TEST_PID\"\nprintf '%s\\n' '\(snapshot)'\nexit 0\n")
+        defer { fixture.stop() }
+        let socket = try fixture.connect()
+        defer { Darwin.close(socket) }
+        try write(socket, Data(fixture.handshake().utf8) + masked(#"{"operation":"subscribe","id":"s"}"#))
+        XCTAssertTrue(try header(socket).hasPrefix("HTTP/1.1 101"))
+        XCTAssertEqual(try frame(socket).1, snapshot)
+        let pid = try XCTUnwrap(Int32(String(contentsOf: fixture.pidFile).trimmingCharacters(in: .whitespacesAndNewlines)))
+        Thread.sleep(forTimeInterval: 0.1)
+        shutdown(socket, SHUT_RDWR)
+        let limit = Date().addingTimeInterval(3)
+        while kill(pid, 0) == 0 && Date() < limit { Thread.sleep(forTimeInterval: 0.01) }
+        XCTAssertEqual(kill(pid, 0), -1)
+    }
+
+    func testDisconnectCancelsSubscriptionWithBackendThatNeverReadsOrWrites() throws {
+        let fixture = try Fixture(script: "echo $$ > \"$TEST_PID\"\nexec /bin/sleep 30\n")
+        defer { fixture.stop() }
+        let socket = try fixture.connect()
+        defer { Darwin.close(socket) }
+        try write(socket, Data(fixture.handshake().utf8) + masked(#"{"operation":"subscribe","id":"s"}"#))
+        XCTAssertTrue(try header(socket).hasPrefix("HTTP/1.1 101"))
+        let startup = Date().addingTimeInterval(3)
+        while !FileManager.default.fileExists(atPath: fixture.pidFile.path) && Date() < startup { Thread.sleep(forTimeInterval: 0.01) }
+        let pid = try XCTUnwrap(Int32(String(contentsOf: fixture.pidFile).trimmingCharacters(in: .whitespacesAndNewlines)))
+        shutdown(socket, SHUT_RDWR)
+        let limit = Date().addingTimeInterval(3)
+        while kill(pid, 0) == 0 && Date() < limit { Thread.sleep(forTimeInterval: 0.01) }
+        XCTAssertEqual(kill(pid, 0), -1)
+    }
+
+    func testUnterminatedBackendEnvelopeIsRejected() throws {
+        let snapshot = #"{"version":1,"type":"snapshot","sessionID":"s","epoch":"e","sequence":0,"status":{"id":"s"},"activity":[]}"#
+        let fixture = try Fixture(script: "read -r request\nprintf '%s' '\(snapshot)'\n")
+        defer { fixture.stop() }
+        let socket = try fixture.connect()
+        defer { Darwin.close(socket) }
+        try write(socket, Data(fixture.handshake().utf8) + masked(#"{"operation":"subscribe","id":"s"}"#))
+        XCTAssertTrue(try header(socket).hasPrefix("HTTP/1.1 101"))
+        let response = try JSONSerialization.jsonObject(with: Data(frame(socket).1.utf8)) as? [String: Any]
+        XCTAssertEqual(response?["type"] as? String, "error")
+        XCTAssertEqual(try frame(socket).0, 8)
+    }
+
     func testStreamLimitDoesNotBlockRPC() throws {
         let fixture = try Fixture(script: "exit 0\n")
         defer { fixture.stop() }

@@ -1,0 +1,87 @@
+name: Nix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  discover:
+    name: Discover flake outputs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.outputs.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+        with:
+          determinate: false
+      - uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7 # v15
+        with:
+          use-gha-cache: enabled
+          use-flakehub: disabled
+      - name: Discover packages and checks
+        id: outputs
+        shell: bash
+        run: |
+          nix eval --impure --json --no-write-lock-file --expr '
+            let flake = builtins.getFlake (toString ./.);
+            in builtins.mapAttrs (_: systems:
+              builtins.mapAttrs (_: builtins.attrNames) systems
+            ) {
+              packages = flake.packages or {};
+              checks = flake.checks or {};
+            }
+          ' > outputs.json
+          matrix=$(jq -ce -f .github/nix-matrix.jq outputs.json)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          jq . <<< "$matrix"
+
+  build:
+    name: Build (${{ matrix.system }})
+    needs: discover
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+        with:
+          determinate: false
+      - uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7 # v15
+        with:
+          use-gha-cache: enabled
+          use-flakehub: disabled
+      - name: Validate flake outputs
+        shell: bash
+        env:
+          EXPECTED_SYSTEM: ${{ matrix.system }}
+        run: |
+          test "$(nix eval --impure --raw --expr builtins.currentSystem)" = "$EXPECTED_SYSTEM"
+          nix flake check --no-build --no-write-lock-file
+      - name: Build discovered packages and checks
+        shell: bash
+        env:
+          TARGETS: ${{ toJSON(matrix.targets) }}
+        run: |
+          targets=()
+          while IFS= read -r target; do
+            targets+=("$target")
+          done < <(jq -er '.[]' <<< "$TARGETS")
+          # Nix builds aliases that share a derivation only once.
+          nix build --no-link --no-write-lock-file --print-build-logs "${targets[@]}"

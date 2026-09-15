@@ -12,6 +12,7 @@ import UIKit
     private var registrationRetry: Task<Void, Never>?
     private var activated = false
     private var refreshing = false
+    private weak var activeConnection: Connection?
 
     func activate() {
         requestDeviceTokenIfNeeded()
@@ -62,98 +63,193 @@ import UIKit
         }
     }
 
-    private func refreshRemoteRegistration(connection: Connection, host: String) async {
+    /// Call before replacing saved credentials. Use a snapshot so another save
+    /// cannot redirect this request to the new Mac while it is suspended.
+    func revoke(connection: Connection) async {
+        activeConnection = connection
+        let captured = connection.context
+        registration.activate(context: captured)
+        guard let token = registration.revoke(host: captured.host) else {
+            UserDefaults.standard.set("No current device token is available to revoke previous alerts. A previous registration may continue until its seven-day lease expires.", forKey: "messageNotificationError")
+            return
+        }
+        do {
+            let reply = try await connection.call(["operation": "notification-unregister", "pushToken": token, "host": captured.host], context: captured)
+            try SiriMessageReceipt.confirmed(reply.ok)
+        } catch {
+            UserDefaults.standard.set("Could not revoke alerts on the previous Mac. Its registration may continue until the seven-day lease expires: " + error.localizedDescription, forKey: "messageNotificationError")
+        }
+    }
+
+    private func observed(_ identity: String) -> Bool {
+        (UserDefaults.standard.stringArray(forKey: "notificationObservedEvents") ?? []).contains(identity)
+    }
+
+    private func recordObserved(_ identity: String) {
+        var identities = UserDefaults.standard.stringArray(forKey: "notificationObservedEvents") ?? []
+        identities.removeAll { $0 == identity }
+        identities.append(identity)
+        UserDefaults.standard.set(Array(identities.suffix(512)), forKey: "notificationObservedEvents")
+    }
+
+    private func eventIdentity(_ info: [AnyHashable: Any]) -> String? {
+        guard let host = info["host"] as? String, let session = info["sessionID"] as? String,
+              let event = info["eventID"] as? String else { return nil }
+        return NotificationEventIdentity.id(host: host, sessionID: session, eventID: event)
+    }
+
+    private func valid(_ connection: Connection, _ captured: ConnectionContext) -> Bool {
+        connection.isCurrent(captured) && !connection.switching && UserDefaults.standard.bool(forKey: "messageNotificationsEnabled")
+    }
+
+    private func refreshRemoteRegistration(connection: Connection, captured: ConnectionContext) async {
+        guard valid(connection, captured) else { return }
+        registration.activate(context: captured)
+        let host = captured.host
         guard let request = registration.beginRemoteRegistration(host: host, now: Date()) else { return }
         var accepted = false
+        var attempted = false
         defer {
             if registration.finishRemoteRegistration(request, accepted: accepted, now: Date()) {
                 UserDefaults.standard.set("Remote notifications registered with the Mac.", forKey: "messageNotificationStatus")
             }
         }
         do {
-            let capabilities = try await connection.call(["operation": "capabilities"])
-            guard connection.host == host, registration.isCurrent(request), capabilities.pushEnabled == true else { return }
-            let reply = try await connection.call(["operation": "notification-register", "pushToken": request.token, "host": host])
+            let capabilities = try await connection.call(["operation": "capabilities"], context: captured)
+            guard valid(connection, captured), registration.isCurrent(request), capabilities.pushEnabled == true else { return }
+            attempted = true
+            let reply = try await connection.call(["operation": "notification-register", "pushToken": request.token, "host": host], context: captured)
             try SiriMessageReceipt.confirmed(reply.ok)
-            accepted = connection.host == host
+            guard valid(connection, captured), registration.isCurrent(request) else {
+                // A revoke may have completed while the earlier registration was
+                // still in flight. Compensate on that same captured endpoint.
+                let revoked = try await connection.call(["operation": "notification-unregister", "pushToken": request.token, "host": host], context: captured)
+                try SiriMessageReceipt.confirmed(revoked.ok)
+                return
+            }
+            accepted = true
         } catch {
+            if attempted && (!valid(connection, captured) || !registration.isCurrent(request)) {
+                // An unconfirmed response can still mean the server committed it.
+                // Best-effort cleanup uses the original credentials, never the new Mac.
+                do {
+                    let revoked = try await connection.call(["operation": "notification-unregister", "pushToken": request.token, "host": host], context: captured)
+                    try SiriMessageReceipt.confirmed(revoked.ok)
+                } catch {
+                    UserDefaults.standard.set("Could not revoke the previous alert registration. It may continue until its seven-day lease expires. " + error.localizedDescription, forKey: "messageNotificationError")
+                    return
+                }
+            }
             // A push failure must not prevent local completion delivery.
-            UserDefaults.standard.set(error.localizedDescription, forKey: "messageNotificationError")
+            UserDefaults.standard.set("Remote alert registration was not confirmed. A previous registration may persist until its seven-day lease expires. " + error.localizedDescription, forKey: "messageNotificationError")
         }
     }
 
     func refresh(connection: Connection) async {
+        activeConnection = connection
         guard UserDefaults.standard.bool(forKey: "messageNotificationsEnabled") else { return }
         guard !refreshing else { return }
         refreshing = true
         defer { refreshing = false }
-        let host = connection.host
+        let captured = connection.context
+        let host = captured.host
+        guard valid(connection, captured) else { return }
         requestDeviceTokenIfNeeded()
-        await refreshRemoteRegistration(connection: connection, host: host)
-        guard connection.host == host else { return }
+        await refreshRemoteRegistration(connection: connection, captured: captured)
+        guard valid(connection, captured) else { return }
         let key = "notificationProgress:" + host
         let saved = UserDefaults.standard.data(forKey: key)
         do {
             var state = try await BackgroundWork.run(priority: .utility) {
                 saved.flatMap { try? JSONDecoder().decode(CompletionNotifications.self, from: $0) } ?? CompletionNotifications()
             }
-            guard connection.host == host else { return }
+            guard valid(connection, captured) else { return }
             for session in connection.sessions where session.isWorking && !state.working.contains(session.id) {
-                let events = try await connection.call(["operation": "transcript", "id": session.id, "after": 0]).events ?? []
-                guard connection.host == host else { return }
+                let events = try await connection.call(["operation": "transcript", "id": session.id, "after": 0], context: captured).events ?? []
+                guard valid(connection, captured) else { return }
                 let previous = state
                 state = try await BackgroundWork.run(priority: .utility) {
                     var prepared = previous
                     prepared.baseline(sessionID: session.id, events: events)
                     return prepared
                 }
-                guard connection.host == host else { return }
+                guard valid(connection, captured) else { return }
             }
             let completed = state.completed(connection.sessions)
-            // Only an unexpired registration for this host and current token replaces local alerts.
-            if !registration.usesRemoteNotifications(host: host, now: Date()) {
-                UserDefaults.standard.set("Local notifications while Autolith can refresh. Background delivery needs APNs on the Mac.", forKey: "messageNotificationStatus")
-                for session in completed {
-                    let events = try await connection.call(["operation": "transcript", "id": session.id, "after": 0]).events ?? []
-                    guard connection.host == host else { return }
-                    let answer = try await BackgroundWork.run(priority: .utility) { SiriContent.latestAnswerEvent(in: events) }
-                    guard connection.host == host else { return }
-                    guard let answer else { continue }
-                    guard state.announced[session.id] != answer.id else { _ = state.acknowledge(sessionID: session.id, eventID: answer.id); continue }
-                    let content = UNMutableNotificationContent()
-                    content.title = session.title
-                    content.body = String(answer.text.prefix(300))
-                    content.sound = .default
-                    content.categoryIdentifier = "autolith.message"
-                    content.threadIdentifier = host + "#" + session.id
-                    content.userInfo = ["host": host, "sessionID": session.id, "eventID": answer.id]
-                    if #available(iOS 27.0, macOS 27.0, *) {
-                        let identity = SiriMessageIdentity(host: host, sessionID: session.id, eventID: answer.id)
-                        content.appEntityIdentifiers = [EntityIdentifier(for: AutolithMessageEntity.self, identifier: identity.id)]
-                    }
-                    try await center.add(UNNotificationRequest(identifier: host + "#" + session.id + "#" + answer.id, content: content, trigger: nil))
+            // Registration acceptance says nothing about delivery. Keep local
+            // fallback, deduplicating events actually observed on this device.
+            let delivered = await center.deliveredNotifications()
+            guard valid(connection, captured) else { return }
+            let deliveredIDs = Set(delivered.compactMap { eventIdentity($0.request.content.userInfo) })
+            for session in completed {
+                let events = try await connection.call(["operation": "transcript", "id": session.id, "after": 0], context: captured).events ?? []
+                guard valid(connection, captured) else { return }
+                let answer = try await BackgroundWork.run(priority: .utility) { SiriContent.latestAnswerEvent(in: events) }
+                guard valid(connection, captured) else { return }
+                guard let answer else { continue }
+                guard state.announced[session.id] != answer.id else { _ = state.acknowledge(sessionID: session.id, eventID: answer.id); continue }
+                let identity = NotificationEventIdentity.id(host: host, sessionID: session.id, eventID: answer.id)
+                if deliveredIDs.contains(identity) || observed(identity) {
                     _ = state.acknowledge(sessionID: session.id, eventID: answer.id)
+                    continue
                 }
+                let content = UNMutableNotificationContent()
+                content.title = session.title
+                content.body = String(answer.text.prefix(300))
+                content.sound = .default
+                content.categoryIdentifier = "autolith.message"
+                content.threadIdentifier = host + "#" + session.id
+                content.userInfo = ["host": host, "sessionID": session.id, "eventID": answer.id, "notificationID": identity]
+                if #available(iOS 27.0, macOS 27.0, *) {
+                    let identity = SiriMessageIdentity(host: host, sessionID: session.id, eventID: answer.id)
+                    content.appEntityIdentifiers = [EntityIdentifier(for: AutolithMessageEntity.self, identifier: identity.id)]
+                }
+                guard valid(connection, captured) else { return }
+                try await center.add(UNNotificationRequest(identifier: identity, content: content, trigger: nil))
+                guard valid(connection, captured) else {
+                    center.removePendingNotificationRequests(withIdentifiers: [identity])
+                    center.removeDeliveredNotifications(withIdentifiers: [identity])
+                    return
+                }
+                _ = state.acknowledge(sessionID: session.id, eventID: answer.id)
             }
             let finalState = state
             let encoded = try await BackgroundWork.run(priority: .utility) { try JSONEncoder().encode(finalState) }
-            guard connection.host == host else { return }
+            guard valid(connection, captured) else { return }
             UserDefaults.standard.set(encoded, forKey: key)
         } catch { UserDefaults.standard.set(error.localizedDescription, forKey: "messageNotificationError") }
     }
 
-    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions { [.banner, .sound, .list] }
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+        await presentation(for: notification)
+    }
+
+    private func presentation(for notification: UNNotification) -> UNNotificationPresentationOptions {
+        if let identity = eventIdentity(notification.request.content.userInfo) {
+            guard !observed(identity) else { return [] }
+            recordObserved(identity)
+        }
+        return [.banner, .sound, .list]
+    }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
         await handle(response)
     }
 
     private func handle(_ response: UNNotificationResponse) async {
-        guard response.actionIdentifier != UNNotificationDismissActionIdentifier else { return }
         let info = response.notification.request.content.userInfo
+        if let identity = eventIdentity(info) { recordObserved(identity) }
+        guard response.actionIdentifier != UNNotificationDismissActionIdentifier else { return }
         guard let host = info["host"] as? String, let id = info["sessionID"] as? String else { return }
-        let connection = Connection()
-        guard CompanionEndpoint.equivalent(connection.host, host) else {
+        let draftKey = "notificationReplyDraft:" + NotificationEventIdentity.id(host: host, sessionID: id, eventID: "draft")
+        if let reply = response as? UNTextInputNotificationResponse {
+            // Save before attempting delivery, including wrong-host and offline replies.
+            // Restoration only fills the composer; it never queues a send.
+            UserDefaults.standard.set(reply.userText, forKey: draftKey)
+        }
+        let connection = activeConnection ?? Connection()
+        let captured = connection.context
+        guard !connection.switching, CompanionEndpoint.equivalent(captured.host, host) else {
             UserDefaults.standard.set("This notification belongs to a different Mac.", forKey: "messageNotificationError")
             return
         }
@@ -162,13 +258,16 @@ import UIKit
                 _ = try SiriContent.question(reply.userText)
                 let text = reply.userText.trimmingCharacters(in: .whitespacesAndNewlines)
                 let requestID = UUID().uuidString
-                let result = try await connection.call(["operation": "message-send", "id": id, "requestID": requestID, "text": text])
+                let result = try await connection.call(["operation": "message-send", "id": id, "requestID": requestID, "text": text], context: captured)
                 _ = try SiriMessageReceipt.accepted(events: result.events ?? [], requestID: requestID, text: text)
+                UserDefaults.standard.removeObject(forKey: draftKey)
+                guard connection.isCurrent(captured), !connection.switching else { return }
                 SiriConversationMemory.sent(id: id, host: host)
                 if #available(iOS 27.0, macOS 27.0, *) {
-                    await SiriMessageMaintenance.update(host: connection.host, sessionID: id) { }
+                    await SiriMessageMaintenance.update(host: captured.host, sessionID: id) { }
                 }
             } catch {
+                SiriNavigationState.shared.draft = (host: host, id: id, text: reply.userText)
                 UserDefaults.standard.set(error.localizedDescription, forKey: "messageNotificationError")
                 let content = UNMutableNotificationContent()
                 content.title = "Autolith reply was not confirmed"
@@ -177,10 +276,14 @@ import UIKit
                 try? await center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
             }
         } else {
-            SiriNavigationState.shared.sessionID = id
+            SiriNavigationState.shared.sessionID = (host: host, id: id)
+            if let text = UserDefaults.standard.string(forKey: draftKey) {
+                SiriNavigationState.shared.draft = (host: host, id: id, text: text)
+            }
             if let eventID = info["eventID"] as? String {
                 do {
-                    let events = try await connection.call(["operation": "transcript", "id": id, "after": 0]).events ?? []
+                    let events = try await connection.call(["operation": "transcript", "id": id, "after": 0], context: captured).events ?? []
+                    guard connection.isCurrent(captured) else { return }
                     if let event = events.first(where: { $0.id == eventID }) {
                         _ = try await SiriMessageReading.read(event, sessionID: id, connection: connection)
                     }

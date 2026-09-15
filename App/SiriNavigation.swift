@@ -4,8 +4,8 @@ import AppIntents
 @MainActor final class SiriNavigationState: ObservableObject {
     static let shared = SiriNavigationState()
     @Published var search: String?
-    @Published var sessionID: String?
-    @Published var draft: (String, String)?
+    @Published var sessionID: (host: String, id: String)?
+    @Published var draft: (host: String, id: String, text: String)?
 }
 
 struct SiriNavigation: ViewModifier {
@@ -28,14 +28,19 @@ struct SiriNavigation: ViewModifier {
             .onReceive(navigation.$search) { query in
                 if let query { search = query; navigation.search = nil }
             }
-            .onReceive(navigation.$sessionID) { id in
-                if let id { connection.selection = id; navigation.sessionID = nil }
+            .onReceive(navigation.$sessionID) { target in
+                if let target {
+                    navigation.sessionID = nil
+                    guard CompanionEndpoint.equivalent(target.host, connection.host) else { return }
+                    connection.selection = target.id
+                }
             }
             .onReceive(navigation.$draft) { value in
-                if let (id, text) = value {
+                if let (host, id, text) = value {
+                    navigation.draft = nil
+                    guard CompanionEndpoint.equivalent(host, connection.host) else { return }
                     connection.drafts[id] = text
                     connection.selection = id
-                    navigation.draft = nil
                 }
             }
             .onChange(of: connection.online) { _, online in

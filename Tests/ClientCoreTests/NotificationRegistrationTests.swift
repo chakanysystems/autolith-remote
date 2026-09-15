@@ -4,6 +4,53 @@ import XCTest
 final class NotificationRegistrationTests: XCTestCase {
     private let start = Date(timeIntervalSince1970: 1000)
 
+    func testRevocationRejectsInflightAcceptance() throws {
+        var state = NotificationRegistration()
+        state.receivedDeviceToken("token")
+        let request = try XCTUnwrap(state.beginRemoteRegistration(host: "mac", now: start))
+        XCTAssertEqual(state.revoke(host: "mac"), "token")
+        XCTAssertFalse(state.finishRemoteRegistration(request, accepted: true, now: start))
+        XCTAssertFalse(state.usesRemoteNotifications(host: "mac", now: start))
+        XCTAssertNil(state.beginRemoteRegistration(host: "mac", now: start))
+    }
+
+    func testCredentialAndGenerationChangesInvalidateAcceptedAndPendingRegistration() throws {
+        var state = NotificationRegistration()
+        state.receivedDeviceToken("apns")
+        let first = ConnectionContext(host: "mac", token: "credential-a", generation: 0)
+        state.activate(context: first)
+        let accepted = try XCTUnwrap(state.beginRemoteRegistration(host: "mac", now: start))
+        XCTAssertTrue(state.finishRemoteRegistration(accepted, accepted: true, now: start))
+        state.activate(context: ConnectionContext(host: "mac", token: "credential-b", generation: 0))
+        XCTAssertFalse(state.usesRemoteNotifications(host: "mac", now: start))
+        let pending = try XCTUnwrap(state.beginRemoteRegistration(host: "mac", now: start))
+        state.activate(context: ConnectionContext(host: "mac", token: "credential-b", generation: 1))
+        XCTAssertFalse(state.finishRemoteRegistration(pending, accepted: true, now: start))
+        XCTAssertNotNil(state.beginRemoteRegistration(host: "mac", now: start))
+    }
+
+    func testRevokedContextCannotReregisterUntilSwitchCompletes() throws {
+        var state = NotificationRegistration()
+        state.receivedDeviceToken("apns")
+        let first = ConnectionContext(host: "mac", token: "credential", generation: 0)
+        state.activate(context: first)
+        _ = state.beginRemoteRegistration(host: "mac", now: start)
+        _ = state.revoke(host: "mac")
+        state.activate(context: first)
+        state.receivedDeviceToken("rotated-apns")
+        XCTAssertNil(state.beginRemoteRegistration(host: "mac", now: start))
+        state.activate(context: ConnectionContext(host: "mac", token: "credential", generation: 1))
+        XCTAssertNotNil(state.beginRemoteRegistration(host: "mac", now: start))
+    }
+    func testEventIdentityIsBoundedAndUnambiguous() {
+        let identity = NotificationEventIdentity.id(host: "h", sessionID: "s", eventID: "e")
+        XCTAssertEqual(identity.utf8.count, 64)
+        XCTAssertEqual(identity, NotificationEventIdentity.id(host: "h", sessionID: "s", eventID: "e"))
+        XCTAssertNotEqual(NotificationEventIdentity.id(host: "h#s", sessionID: "x", eventID: "e"),
+                          NotificationEventIdentity.id(host: "h", sessionID: "s#x", eventID: "e"))
+        XCTAssertNotEqual(identity, NotificationEventIdentity.id(host: "h", sessionID: "s", eventID: "e2"))
+    }
+
     func testRequestsOncePerEnabledLaunchAndWaitsForCallback() {
         var state = NotificationRegistration()
         XCTAssertFalse(state.requestDeviceToken(enabled: false, now: start))

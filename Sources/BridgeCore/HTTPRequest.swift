@@ -8,7 +8,14 @@ public enum BridgeError: Error, LocalizedError {
 public struct HTTPRequest {
     public let body: Data
     public let authorization: String
-    public static func parse(_ data: Data) throws -> HTTPRequest? {
+    public struct Header {
+        public let authorization: String
+        public let contentLength: Int
+        public let bodyOffset: Int
+    }
+
+    /// Complete framing validation before accepting a potentially slow request body.
+    public static func parseHeader(_ data: Data) throws -> Header? {
         guard data.count <= 280_000 else { throw BridgeError.invalid("Request too large") }
         guard let boundary = data.range(of: Data("\r\n\r\n".utf8)) else {
             if data.count > 8192 { throw BridgeError.invalid("Headers too large") }
@@ -27,9 +34,14 @@ public struct HTTPRequest {
         }
         guard headers["transfer-encoding"] == nil,
               let raw = headers["content-length"], let count = Int(raw), (0...262144).contains(count) else { throw BridgeError.invalid("Invalid content length") }
-        let available = data.count - boundary.upperBound
-        guard available >= count else { return nil }
-        guard available == count else { throw BridgeError.invalid("Pipelining is unsupported") }
-        return HTTPRequest(body: Data(data[boundary.upperBound...]), authorization: headers["authorization"] ?? "")
+        return Header(authorization: headers["authorization"] ?? "", contentLength: count, bodyOffset: boundary.upperBound)
+    }
+
+    public static func parse(_ data: Data) throws -> HTTPRequest? {
+        guard let header = try parseHeader(data) else { return nil }
+        let available = data.count - header.bodyOffset
+        guard available >= header.contentLength else { return nil }
+        guard available == header.contentLength else { throw BridgeError.invalid("Pipelining is unsupported") }
+        return HTTPRequest(body: Data(data[header.bodyOffset...]), authorization: header.authorization)
     }
 }

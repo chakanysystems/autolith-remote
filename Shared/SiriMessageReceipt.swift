@@ -11,7 +11,7 @@ enum SiriMessageReceipt {
     static func accepted(events: [Event], requestID: String, text: String) throws -> Event {
         guard events.count == 1, let event = events.first,
               event.id == "outbox-" + requestID, event.role == "user", event.text == text,
-              event.deliveryState == "queued", SiriMessageIdentity.date(for: event) != nil,
+              (event.isDeliveryPending || event.deliveryState == "sent"), SiriMessageIdentity.date(for: event) != nil,
               let dispatchAt = event.dispatchAt, dispatchAt.isFinite else { throw Failure.unconfirmed }
         return event
     }

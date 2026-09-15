@@ -98,7 +98,7 @@ struct OpenAutolithConversationIntent: OpenIntent {
     @MainActor func perform() async throws -> some IntentResult {
         let connection = try SiriSessionService.connected()
         try SiriSessionService.requireHost(target.host, connection: connection)
-        SiriNavigationState.shared.sessionID = target.sessionID
+        SiriNavigationState.shared.sessionID = (target.host, target.sessionID)
         return .result()
     }
 }

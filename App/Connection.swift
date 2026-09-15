@@ -21,6 +21,7 @@ struct Reply: Codable, Sendable {
     var ok: Bool?
     var revision: String?; var baseRevision: String?; var eventOrder: [String]?; var notModified: Bool?
     var readIDs: [String]?
+    var state: String?; var requestID: String?
 }
 
 @MainActor final class Connection: ObservableObject {
@@ -48,8 +49,8 @@ struct Reply: Codable, Sendable {
     @Published var online = false
     @Published var error: String?
     @Published var busy = false
-    @Published var host = UserDefaults.standard.string(forKey: "host") ?? ""
-    @Published var token = ""
+    @Published private(set) var host = UserDefaults.standard.string(forKey: "host") ?? ""
+    @Published private(set) var token = ""
     @Published private(set) var refreshing = false
     @Published private(set) var loadingTranscript: String?
     @Published private(set) var loadingCatalog = false
@@ -64,6 +65,9 @@ struct Reply: Codable, Sendable {
     private var catalogSession: String?
     private var catalogRequest = UUID()
     private var generation = 0
+    var context: ConnectionContext { ConnectionContext(host: host, token: token, generation: generation) }
+    func isCurrent(_ captured: ConnectionContext) -> Bool { context == captured }
+    private(set) var switching = false
     private var cached: [String: CachedTranscript] = [:]
     private var fetches: [String: Task<Void, Never>] = [:]
     private var sessionEpochs: [String: UUID] = [:]
@@ -84,6 +88,8 @@ struct Reply: Codable, Sendable {
         guard restoreCache else { return }
         let key = TranscriptCache.key(host: host, token: token)
         Task {
+            guard generation == 0 else { return }
+            try? await TranscriptCache.shared.activate(key: key, initializing: true)
             let snapshot = await TranscriptCache.shared.load(key: key)
             guard generation == 0 else { return }
             if sessions.isEmpty, !online { sessions = snapshot.sessions }
@@ -96,34 +102,78 @@ struct Reply: Codable, Sendable {
             trimCache()
         }
     }
-    func save() throws {
-        _ = try endpoint()
+    func updateOutbox(_ operation: String, event: Event, sessionID: String, context captured: ConnectionContext) async {
+        let allowed = operation == "message-retry" ? event.canRetryDelivery : operation == "message-abandon" && event.canAbandonDelivery
+        guard isCurrent(captured), !switching, !busy, allowed else { return }
+        busy = true
+        defer { if isCurrent(captured) { busy = false } }
+        do {
+            let reply = try await call(["operation": operation, "id": sessionID, "eventID": event.id], context: captured)
+            guard isCurrent(captured), !Task.isCancelled else { return }
+            if operation == "message-abandon" { try SiriMessageReceipt.confirmed(reply.ok) }
+            else {
+                _ = try SiriMessageReceipt.accepted(events: reply.events ?? [], requestID: event.outboxRequestID ?? "", text: event.text)
+            }
+            if let pending = fetches[sessionID] { await pending.value }
+            guard isCurrent(captured), !Task.isCancelled else { return }
+            await loadTranscript(sessionID)
+        } catch {
+            guard isCurrent(captured), !Task.isCancelled else { return }
+            self.error = error.localizedDescription
+            // Read the authoritative result; never replay an uncertain mutation.
+            if let pending = fetches[sessionID] { await pending.value }
+            guard isCurrent(captured), !Task.isCancelled else { return }
+            await loadTranscript(sessionID)
+        }
+    }
+
+    /// Probe without mutating the active connection or its drafts.
+    func apply(host: String, token: String) async throws {
+        guard !switching else { throw CancellationError() }
+        switching = true
+        defer { switching = false; restartStream() }
+        let previous = context
+        let candidate = ConnectionContext(host: try CompanionEndpoint.canonical(host), token: token, generation: generation)
+        try await ConnectionCandidateProbe.validate(previous: previous, candidate: candidate, current: { self.context }) { candidate in
+            let reply = try await self.call(["operation": "list"], context: candidate)
+            guard reply.sessions != nil else { throw self.failure("The Mac did not return a session list.") }
+        }
+        guard previous.host != candidate.host || previous.token != candidate.token else { return }
+        // Invalidate in-flight UI work before waiting for old-identity revocation.
+        generation += 1
+        refreshing = false; busy = false; loadingTranscript = nil; loadingCatalog = false
+        catalogRequest = UUID()
+        persistTask?.cancel(); persistTask = nil; maintenanceTask?.cancel(); maintenanceTask = nil
+        readTask?.cancel(); readTask = nil
+        fetches.values.forEach { $0.cancel() }; fetches = [:]
+        stopStream()
+        let retiring = context
+        activities.quiesce()
+        await MessageNotifications.shared.revoke(connection: self)
+        guard isCurrent(retiring), !Task.isCancelled else { throw CancellationError() }
+        await activities.end()
+        guard isCurrent(retiring), !Task.isCancelled else { throw CancellationError() }
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "Autolith", kSecAttrAccount as String: "companion"]
-        let values: [String: Any] = [kSecValueData as String: Data(token.utf8), kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly]
+        let values: [String: Any] = [kSecValueData as String: Data(candidate.token.utf8), kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly]
         let status = SecItemUpdate(query as CFDictionary, values as CFDictionary)
         if status == errSecItemNotFound {
             guard SecItemAdd(query.merging(values) { _, new in new } as CFDictionary, nil) == errSecSuccess else { throw failure("Could not save the token in Keychain.") }
         } else if status != errSecSuccess { throw failure("Could not update Keychain.") }
-        let previousHost = UserDefaults.standard.string(forKey: "host") ?? ""
-        host = try CompanionEndpoint.canonical(host)
-        CompanionEndpoint.migratePreferences()
-        UserDefaults.standard.set(host, forKey: "host")
+        self.host = candidate.host; self.token = candidate.token
+        UserDefaults.standard.set(candidate.host, forKey: "host")
         generation += 1
         persistTask?.cancel(); persistTask = nil; maintenanceTask?.cancel(); maintenanceTask = nil
         readTask?.cancel(); readTask = nil; readQueue = [:]
         fetches.values.forEach { $0.cancel() }; fetches = [:]; cached = [:]; sessionEpochs = [:]
         stopStream()
         events = [:]; sessions = []; drafts = [:]; online = false
+        refreshing = false; loadingTranscript = nil; busy = false; loadingCatalog = false
         models = []; completions = []; catalogSession = nil; catalogRequest = UUID(); selection = nil
-        let savedHost = host
-        let savedGeneration = generation
-        Task {
-            guard generation == savedGeneration, host == savedHost else { return }
-            await activities.end()
-            guard generation == savedGeneration, host == savedHost else { return }
-            if #available(iOS 27.0, macOS 27.0, *), !CompanionEndpoint.equivalent(previousHost, savedHost) {
-                await AutolithConversationContext.retireOtherHosts(savedHost)
-            }
+        let saved = context
+        try await TranscriptCache.shared.activate(key: TranscriptCache.key(host: saved.host, token: saved.token))
+        guard isCurrent(saved) else { throw CancellationError() }
+        if #available(iOS 27.0, macOS 27.0, *), previous.host != saved.host {
+            await AutolithConversationContext.retireOtherHosts(saved.host)
         }
     }
     func failure(_ message: String) -> NSError { NSError(domain: "Autolith", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
@@ -133,24 +183,25 @@ struct Reply: Codable, Sendable {
         guard !token.isEmpty else { throw failure("Enter your companion token.") }
         return url.appendingPathComponent("rpc")
     }
-    func call(_ payload: [String: Any]) async throws -> Reply {
-        var request = URLRequest(url: try endpoint())
+    func call(_ payload: [String: Any], context captured: ConnectionContext? = nil) async throws -> Reply {
+        let identity = captured ?? context
+        var request = URLRequest(url: try identity.endpoint())
         request.httpMethod = "POST"
         request.timeoutInterval = 75
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(identity.token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await BoundedHTTP.data(for: request, limit: BoundedHTTP.limit(operation: payload["operation"] as? String ?? ""))
+        guard response.statusCode == 200 else { throw failure("The Mac companion rejected the request (\(response.statusCode)).") }
         let reply = try await BackgroundWork.run { try JSONDecoder().decode(Reply.self, from: data) }
         if let message = reply.error { throw failure(message) }
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { throw failure("The Mac companion rejected the request.") }
         return reply
     }
     func refresh() async {
-        guard !refreshing, !host.isEmpty, !token.isEmpty else { return }
+        guard !switching, !refreshing, !host.isEmpty, !token.isEmpty else { return }
         refreshing = true
         let generation = self.generation
-        defer { refreshing = false; loadingTranscript = nil }
+        defer { if generation == self.generation { refreshing = false; loadingTranscript = nil } }
         var listSucceeded = false
         do {
             let reply = try await call(["operation": "list"])
@@ -183,7 +234,9 @@ struct Reply: Codable, Sendable {
                 await loadTranscript(id)
             }
             // Load the visible transcript before notification and Siri maintenance.
+            guard generation == self.generation else { return }
             await activities.update(sessions, connection: self)
+            guard generation == self.generation else { return }
             persistCache(); flushReadReceipts()
             scheduleMaintenance()
         } catch {
@@ -202,7 +255,7 @@ struct Reply: Codable, Sendable {
         let epoch = sessionEpochs[id], generation = self.generation
         let task = Task { [weak self] in
             guard let self else { return }
-            defer { if self.sessionEpochs[id] == epoch { self.fetches[id] = nil }; if self.loadingTranscript == id { self.loadingTranscript = nil } }
+            defer { if self.generation == generation, self.sessionEpochs[id] == epoch { self.fetches[id] = nil; if self.loadingTranscript == id { self.loadingTranscript = nil } } }
             if self.events[id] == nil { self.loadingTranscript = id }
             do {
                 let snapshot = self.cached[id] ?? CachedTranscript(revision: "", events: [], accessed: Date())
@@ -215,6 +268,7 @@ struct Reply: Codable, Sendable {
                 do {
                     prepared = try await Self.prepareTranscript(snapshot, reply: reply)
                 } catch CachedTranscript.CacheError.invalidRevision {
+                    guard !Task.isCancelled, self.generation == generation, self.sessionEpochs[id] == epoch else { return }
                     reply = try await self.call(["operation": "transcript-sync", "id": id])
                     guard !Task.isCancelled, self.generation == generation, self.sessionEpochs[id] == epoch else { return }
                     guard reply.revision != nil, reply.eventOrder == nil, reply.notModified != true else { throw CachedTranscript.CacheError.invalidRevision }
@@ -475,44 +529,56 @@ struct Reply: Codable, Sendable {
         return await control("tell", id: session.id, message: command)
     }
     func control(_ operation: String, id: String, message: String? = nil) async -> Bool {
-        guard !busy else { return false }
+        guard !switching, !busy else { return false }
+        let captured = context
         busy = true
-        defer { busy = false }
+        defer { if isCurrent(captured) { busy = false } }
         do {
             var payload: [String: Any] = ["operation": operation, "id": id]
             if let message { payload["message"] = message }
-            _ = try await call(payload)
+            _ = try await call(payload, context: captured)
+            guard isCurrent(captured), !Task.isCancelled else { return false }
             await refresh()
-            return true
-        } catch { self.error = error.localizedDescription; return false }
+            return isCurrent(captured) && !Task.isCancelled
+        } catch { if isCurrent(captured) { self.error = error.localizedDescription }; return false }
     }
     func create(workspace: String, permissions: String) async -> Bool {
-        guard !busy else { return false }
+        guard !switching, !busy else { return false }
+        let captured = context
         busy = true
-        defer { busy = false }
-        do { selection = try await call(["operation": "create", "workspace": workspace, "permissions": permissions]).id; await refresh(); return true }
-        catch { self.error = error.localizedDescription; return false }
+        defer { if isCurrent(captured) { busy = false } }
+        do {
+            let reply = try await call(["operation": "create", "workspace": workspace, "permissions": permissions], context: captured)
+            guard isCurrent(captured), !Task.isCancelled else { return false }
+            selection = reply.id
+            await refresh()
+            return isCurrent(captured) && !Task.isCancelled
+        } catch { if isCurrent(captured) { self.error = error.localizedDescription }; return false }
     }
     func resume(_ session: Session) async {
-        guard !busy else { return }
+        guard !switching, !busy else { return }
+        let captured = context
         busy = true
-        defer { busy = false }
+        defer { if isCurrent(captured) { busy = false } }
         do {
-            selection = try await call(["operation": "resume", "id": session.id,
-                                        "workspace": session.workspace, "permissions": "ask"]).id
+            let reply = try await call(["operation": "resume", "id": session.id,
+                                        "workspace": session.workspace, "permissions": "ask"], context: captured)
+            guard isCurrent(captured), !Task.isCancelled else { return }
+            selection = reply.id
             await refresh()
-        } catch { self.error = error.localizedDescription }
+        } catch { if isCurrent(captured) { self.error = error.localizedDescription } }
     }
     func delete(_ session: Session) async {
         guard !session.isRunning else { return }
-        if await control("delete", id: session.id) {
+        let captured = context
+        if await control("delete", id: session.id), isCurrent(captured) {
             cached[session.id] = nil; sessionEpochs[session.id] = nil
-            events[session.id] = nil
-            drafts[session.id] = nil
+            events[session.id] = nil; drafts[session.id] = nil
             fetches[session.id]?.cancel(); fetches[session.id] = nil
-            sessions.removeAll { $0.id == session.id }
-            readQueue[session.id] = nil
-            await persistCacheNow(); scheduleMaintenance()
+            sessions.removeAll { $0.id == session.id }; readQueue[session.id] = nil
+            await persistCacheNow()
+            guard isCurrent(captured) else { return }
+            scheduleMaintenance()
             if selection == session.id { selection = nil }
         }
     }

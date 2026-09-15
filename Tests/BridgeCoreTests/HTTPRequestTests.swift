@@ -9,6 +9,13 @@ final class HTTPRequestTests: XCTestCase {
         XCTAssertEqual(request.body, body)
         XCTAssertEqual(request.authorization, "Bearer secret")
     }
+    func testAuthenticationHeaderIsAvailableBeforeBody() throws {
+        let bytes = Data("POST /rpc HTTP/1.1\r\nContent-Length: 100\r\nAuthorization: Bearer fixture\r\n\r\npartial".utf8)
+        XCTAssertEqual(try HTTPRequest.parseHeader(bytes)?.authorization, "Bearer fixture")
+        XCTAssertNil(try HTTPRequest.parse(bytes))
+        let ambiguous = Data("POST /rpc HTTP/1.1\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n".utf8)
+        XCTAssertThrowsError(try HTTPRequest.parseHeader(ambiguous))
+    }
     func testRejectsAmbiguousFraming() {
         for header in ["Content-Length: -1", "Content-Length: 262145", "Content-Length: 0\r\nContent-Length: 0", "Content-Length: 0\r\nTransfer-Encoding: chunked"] {
             XCTAssertThrowsError(try HTTPRequest.parse(Data("POST /rpc HTTP/1.1\r\n\(header)\r\n\r\n".utf8)))

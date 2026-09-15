@@ -1,12 +1,14 @@
 import Foundation
 import CryptoKit
 import ClientCore
+import BridgeCore
 
 // Push credentials stay on the Mac. The only outbound destinations are Apple's APNs hosts.
 final class PushService: @unchecked Sendable {
     private struct Registration {
         let token: String
-        let expires: Date
+        var expires: Date
+        var revision = UUID()
         var lastState: WorkSummary?
         var lastSent = Date.distantPast
     }
@@ -24,8 +26,17 @@ final class PushService: @unchecked Sendable {
     private var polling = false
     private var cachedJWT: (value: String, created: Date)?
     private var timer: DispatchSourceTimer?
-    var enabled: Bool { configuration != nil }
+    private var injectedSender: ((WorkSummary, String) async throws -> Int)?
+    private var now: () -> Date = Date.init
+    var enabled: Bool { configuration != nil || injectedSender != nil }
 
+    /// No credentials, timer, or network needed for delivery/race tests.
+    init(snapshot: @escaping () throws -> Data, sender: @escaping (WorkSummary, String) async throws -> Int, now: @escaping () -> Date = Date.init) {
+        configuration = nil
+        self.snapshot = snapshot
+        injectedSender = sender
+        self.now = now
+    }
     init(environment: [String: String], snapshot: @escaping () throws -> Data) throws {
         self.snapshot = snapshot
         if let path = environment["AUTOLITH_APNS_KEY_FILE"] {
@@ -34,24 +45,20 @@ final class PushService: @unchecked Sendable {
                   let bundle = environment["AUTOLITH_APNS_BUNDLE_ID"], !bundle.isEmpty else {
                 throw NSError(domain: "AutolithPush", code: 1, userInfo: [NSLocalizedDescriptionKey: "APNs requires KEY_ID, TEAM_ID, and BUNDLE_ID alongside KEY_FILE."])
             }
-            let attributes = try FileManager.default.attributesOfItem(atPath: path)
-            guard (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600,
-                  (attributes[.ownerAccountID] as? NSNumber)?.uint32Value == getuid(),
-                  attributes[.type] as? FileAttributeType == .typeRegular else {
-                throw NSError(domain: "AutolithPush", code: 2, userInfo: [NSLocalizedDescriptionKey: "APNs key must be an owned regular file with mode 0600."])
-            }
-            configuration = Configuration(key: try P256.Signing.PrivateKey(pemRepresentation: String(contentsOfFile: path)),
+            let data = try PrivateFile.readSecret(at: URL(fileURLWithPath: path), maximumBytes: 16384)
+            guard let pem = String(data: data, encoding: .utf8) else { throw BridgeError.invalid("APNs key is not UTF-8.") }
+            configuration = Configuration(key: try P256.Signing.PrivateKey(pemRepresentation: pem),
                                           keyID: keyID, teamID: team, bundleID: bundle,
                                           sandbox: environment["AUTOLITH_APNS_ENVIRONMENT"] != "production")
         } else { configuration = nil }
         if enabled {
             let timer = DispatchSource.makeTimerSource(queue: queue)
             timer.schedule(deadline: .now() + 5, repeating: 15)
-            timer.setEventHandler { [weak self] in self?.tick() }
+            timer.setEventHandler { [weak self] in Task { await self?.pollOnce() } }
             timer.resume(); self.timer = timer
         }
     }
-    func register(_ object: [String: Any]) throws {
+    func register(_ object: [String: Any], beforeMutation: () throws -> Void = {}) throws {
         guard enabled else { throw NSError(domain: "AutolithPush", code: 3, userInfo: [NSLocalizedDescriptionKey: "APNs is not configured on this Mac."]) }
         guard let id = object["activityId"] as? String, !id.isEmpty, id.count <= 128,
               let token = object["pushToken"] as? String, (32...512).contains(token.count),
@@ -59,45 +66,53 @@ final class PushService: @unchecked Sendable {
             throw NSError(domain: "AutolithPush", code: 4, userInfo: [NSLocalizedDescriptionKey: "Invalid Live Activity registration."])
         }
         try queue.sync {
-            registrations = registrations.filter { $0.value.expires > Date() }
+            try beforeMutation()
+            registrations = registrations.filter { $0.value.expires > now() }
             guard registrations[id] != nil || registrations.count < 16 else {
                 throw NSError(domain: "AutolithPush", code: 5, userInfo: [NSLocalizedDescriptionKey: "Too many Live Activity registrations."])
             }
             if registrations[id]?.token != token {
-                registrations[id] = Registration(token: token, expires: Date().addingTimeInterval(8 * 3600))
+                registrations[id] = Registration(token: token, expires: now().addingTimeInterval(8 * 3600))
             }
+            registrations[id]?.expires = now().addingTimeInterval(8 * 3600)
+            registrations[id]?.revision = UUID()
         }
     }
-    private func tick() {
-        registrations = registrations.filter { $0.value.expires > Date() }
-        guard !polling, !registrations.isEmpty, let configuration else { return }
-        polling = true
-        let pending = registrations
-        Task {
-            defer { queue.async { self.polling = false } }
-            do {
-                let summary = try WorkSummary.decodeSessions(snapshot())
-                for (id, registration) in pending {
-                    guard registration.lastState != summary || Date().timeIntervalSince(registration.lastSent) > 45 else { continue }
-                    let content = summary.sessions == 0 ? (registration.lastState ?? summary).finished : summary
-                    let status = try await send(content, token: registration.token, configuration: configuration)
-                    queue.async {
-                        guard self.registrations[id]?.token == registration.token else { return }
-                        if status == 410 || status == 400 || (status == 200 && summary.sessions == 0) {
-                            self.registrations[id] = nil
-                        } else if status == 200 {
-                            self.registrations[id]?.lastState = summary
-                            self.registrations[id]?.lastSent = Date()
-                        }
+    func pollOnce() async {
+        let pending: [String: Registration] = queue.sync {
+            registrations = registrations.filter { $0.value.expires > now() }
+            guard enabled, !polling, !registrations.isEmpty else { return [:] }
+            polling = true
+            return registrations
+        }
+        guard !pending.isEmpty else { return }
+        defer { queue.sync { polling = false } }
+        do {
+            let summary = try WorkSummary.decodeSessions(snapshot())
+            for (id, registration) in pending {
+                guard registration.lastState != summary || now().timeIntervalSince(registration.lastSent) > 45 else { continue }
+                guard queue.sync(execute: { registrations[id]?.revision == registration.revision && (registrations[id]?.expires ?? .distantPast) > now() }) else { continue }
+                let content = summary.sessions == 0 ? (registration.lastState ?? summary).finished : summary
+                let status: Int
+                if let injectedSender { status = try await injectedSender(content, registration.token) }
+                else if let configuration { status = try await send(content, token: registration.token, configuration: configuration) }
+                else { continue }
+                queue.sync {
+                    guard self.registrations[id]?.revision == registration.revision else { return }
+                    if status == 410 || status == 400 || (status == 200 && summary.sessions == 0) {
+                        self.registrations[id] = nil
+                    } else if status == 200 {
+                        self.registrations[id]?.lastState = summary
+                        self.registrations[id]?.lastSent = now()
                     }
-                    if status != 200 { fputs("Live Activity push rejected (HTTP \(status)). Check APNs configuration.\n", stderr) }
                 }
-            } catch { fputs("Live Activity update failed; will retry.\n", stderr) }
-        }
+                if status != 200 { fputs("Live Activity push rejected (HTTP \(status)). Check APNs configuration.\n", stderr) }
+            }
+        } catch { fputs("Live Activity update failed; will retry.\n", stderr) }
     }
-    func sendAlert(_ payload: [String: Any], token: String) async throws -> Int {
+    func sendAlert(_ payload: [String: Any], token: String, collapseID: String) async throws -> Int {
         guard let configuration else { throw NSError(domain: "AutolithPush", code: 3, userInfo: [NSLocalizedDescriptionKey: "APNs is not configured."]) }
-        return try await sendPayload(payload, token: token, type: "alert", configuration: configuration)
+        return try await sendPayload(payload, token: token, type: "alert", configuration: configuration, collapseID: collapseID)
     }
 
     private func send(_ state: WorkSummary, token: String, configuration: Configuration) async throws -> Int {
@@ -108,7 +123,7 @@ final class PushService: @unchecked Sendable {
         return try await sendPayload(["aps": aps], token: token, type: "liveactivity", configuration: configuration)
     }
 
-    private func sendPayload(_ payload: [String: Any], token: String, type: String, configuration: Configuration) async throws -> Int {
+    private func sendPayload(_ payload: [String: Any], token: String, type: String, configuration: Configuration, collapseID: String? = nil) async throws -> Int {
         func base64url(_ data: Data) -> String {
             data.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
         }
@@ -131,6 +146,7 @@ final class PushService: @unchecked Sendable {
         request.setValue(type, forHTTPHeaderField: "apns-push-type")
         request.setValue(type == "alert" ? configuration.bundleID : configuration.bundleID + ".push-type.liveactivity", forHTTPHeaderField: "apns-topic")
         request.setValue(type == "alert" ? "10" : "5", forHTTPHeaderField: "apns-priority")
+        if let collapseID { request.setValue(collapseID, forHTTPHeaderField: "apns-collapse-id") }
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
         let (_, response) = try await URLSession.shared.data(for: request)
         return (response as? HTTPURLResponse)?.statusCode ?? 0
