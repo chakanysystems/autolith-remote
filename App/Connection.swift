@@ -76,6 +76,12 @@ struct Reply: Codable, Sendable {
     private var maintenanceDirty = false
     private var readQueue: [String: Set<String>] = [:]
     private var readTask: Task<Void, Never>?
+    private func keychainFailure(_ status: OSStatus) -> Error {
+        let detail = SecCopyErrorMessageString(status, nil) as String? ?? "Unknown security error"
+        let hint = status == errSecMissingEntitlement
+            ? " Install a build signed with the app’s Keychain access entitlement." : ""
+        return failure("Could not save the token in Keychain: \(detail) (\(status)).\(hint)")
+    }
     init(restoreCache: Bool = false) {
         CompanionEndpoint.migratePreferences()
         host = (try? CompanionEndpoint.canonical(host)) ?? host
@@ -157,8 +163,9 @@ struct Reply: Codable, Sendable {
         let values: [String: Any] = [kSecValueData as String: Data(candidate.token.utf8), kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly]
         let status = SecItemUpdate(query as CFDictionary, values as CFDictionary)
         if status == errSecItemNotFound {
-            guard SecItemAdd(query.merging(values) { _, new in new } as CFDictionary, nil) == errSecSuccess else { throw failure("Could not save the token in Keychain.") }
-        } else if status != errSecSuccess { throw failure("Could not update Keychain.") }
+            let addStatus = SecItemAdd(query.merging(values) { _, new in new } as CFDictionary, nil)
+            guard addStatus == errSecSuccess else { throw keychainFailure(addStatus) }
+        } else if status != errSecSuccess { throw keychainFailure(status) }
         self.host = candidate.host; self.token = candidate.token
         UserDefaults.standard.set(candidate.host, forKey: "host")
         generation += 1
