@@ -82,13 +82,13 @@ struct ResponseAccumulator {
 
 /// URLSession delivers decoded chunks here, without collecting an unbounded response first.
 /// The lock also covers cancellation, which can arrive outside the serial delegate queue.
-private final class BoundedHTTPTransfer: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+private final class BoundedHTTPTransfer: @unchecked Sendable {
     private typealias Reply = (Data, HTTPURLResponse)
     private let lock = NSLock()
     private var accumulator: ResponseAccumulator
     private var response: HTTPURLResponse?
     private var continuation: CheckedContinuation<Reply, Error>?
-    private var session: URLSession?
+    private var task: URLSessionDataTask?
     private var finished = false
 
     init(limit: Int) {
@@ -103,12 +103,9 @@ private final class BoundedHTTPTransfer: NSObject, URLSessionDataDelegate, @unch
             return
         }
         self.continuation = continuation
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.urlCache = nil
-        let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
-        self.session = session
-        let task = session.dataTask(with: request)
-        // Resume under the lock so cancellation cannot invalidate the session before task creation.
+        let task = BoundedHTTPTransport.shared.task(request, transfer: self)
+        self.task = task
+        // Resume under the lock so cancellation cannot precede task registration.
         task.resume()
         lock.unlock()
     }
@@ -122,17 +119,18 @@ private final class BoundedHTTPTransfer: NSObject, URLSessionDataDelegate, @unch
         guard !finished else { lock.unlock(); return }
         finished = true
         let continuation = self.continuation
-        let session = self.session
+        let task = self.task
         self.continuation = nil
-        self.session = nil
+        self.task = nil
         lock.unlock()
-        session?.invalidateAndCancel()
+        if let task {
+            BoundedHTTPTransport.shared.remove(task)
+            task.cancel()
+        }
         continuation?.resume(with: result)
     }
 
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
-                    didReceive response: URLResponse,
-                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+    func receive(_ response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         lock.lock()
         guard !finished else { lock.unlock(); completionHandler(.cancel); return }
         do {
@@ -148,7 +146,7 @@ private final class BoundedHTTPTransfer: NSObject, URLSessionDataDelegate, @unch
         }
     }
 
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+    func receive(_ data: Data) {
         lock.lock()
         guard !finished else { lock.unlock(); return }
         do {
@@ -160,7 +158,7 @@ private final class BoundedHTTPTransfer: NSObject, URLSessionDataDelegate, @unch
         }
     }
 
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+    func complete(_ error: Error?) {
         lock.lock()
         guard !finished else { lock.unlock(); return }
         let result: Result<Reply, Error>
@@ -173,5 +171,58 @@ private final class BoundedHTTPTransfer: NSObject, URLSessionDataDelegate, @unch
         }
         lock.unlock()
         finish(result)
+    }
+}
+
+/// Reuse connections while keeping credentials, byte limits, and cancellation per request.
+private final class BoundedHTTPTransport: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    static let shared = BoundedHTTPTransport()
+    private let lock = NSLock()
+    private var transfers: [Int: BoundedHTTPTransfer] = [:]
+    private var session: URLSession!
+
+    private override init() {
+        super.init()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil
+        configuration.urlCredentialStorage = nil
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+    }
+
+    func task(_ request: URLRequest, transfer: BoundedHTTPTransfer) -> URLSessionDataTask {
+        let task = session.dataTask(with: request)
+        lock.lock(); transfers[task.taskIdentifier] = transfer; lock.unlock()
+        return task
+    }
+
+    func remove(_ task: URLSessionTask) {
+        lock.lock(); transfers[task.taskIdentifier] = nil; lock.unlock()
+    }
+
+    private func transfer(_ task: URLSessionTask) -> BoundedHTTPTransfer? {
+        lock.lock(); defer { lock.unlock() }
+        return transfers[task.taskIdentifier]
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard let transfer = transfer(dataTask) else { completionHandler(.cancel); return }
+        transfer.receive(response, completionHandler: completionHandler)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        transfer(dataTask)?.receive(data)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        transfer(task)?.complete(error)
+    }
+
+    // Never forward a bearer token through a redirect or silently replay a command.
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
     }
 }

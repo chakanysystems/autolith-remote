@@ -11,6 +11,26 @@ import Glibc
 @testable import ClientCore
 
 final class BoundedHTTPTests: XCTestCase {
+    func testSequentialRequestsReuseOneConnectionWithIndependentLimits() async throws {
+        let fixture = try HTTPFixture(response: Data("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc".utf8), responseCount: 2)
+        defer { fixture.stop() }
+        let first = try await BoundedHTTP.data(for: fixture.request, limit: 3)
+        XCTAssertEqual(first.0, Data("abc".utf8))
+        await assertLengthError(fixture, limit: 2)
+    }
+
+    func testCancellationDoesNotCancelAnotherTransfer() async throws {
+        let received = expectation(description: "blocked request")
+        let blocked = try HTTPFixture(response: Data(), holdOpen: true, received: { received.fulfill() })
+        let healthy = try HTTPFixture(response: Data("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".utf8))
+        defer { blocked.stop(); healthy.stop() }
+        let task = Task { try await BoundedHTTP.data(for: blocked.request, limit: 10) }
+        await fulfillment(of: [received], timeout: 3)
+        task.cancel()
+        let result = try await BoundedHTTP.data(for: healthy.request, limit: 2)
+        XCTAssertEqual(result.0, Data("ok".utf8))
+        await assertCancelled(task)
+    }
     func testDeclaredOverflowIsRejectedBeforeCompleteBodyArrives() async throws {
         let fixture = try HTTPFixture(response: Data("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 65\r\n\r\na".utf8), holdOpen: true)
         defer { fixture.stop() }
@@ -85,7 +105,7 @@ private final class HTTPFixture {
     private let release = DispatchSemaphore(value: 0)
     private let finished = DispatchGroup()
 
-    init(response: Data, holdOpen: Bool = false, received: @escaping () -> Void = {}) throws {
+    init(response: Data, holdOpen: Bool = false, responseCount: Int = 1, received: @escaping () -> Void = {}) throws {
         #if canImport(Darwin)
         let descriptor = socket(AF_INET, SOCK_STREAM, 0)
         #else
@@ -129,6 +149,7 @@ private final class HTTPFixture {
             var enabled: Int32 = 1
             setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &enabled, socklen_t(MemoryLayout<Int32>.size))
             #endif
+            for _ in 0..<responseCount {
             var header = Data()
             while !header.suffix(4).elementsEqual([13, 10, 13, 10]) {
                 var byte: UInt8 = 0
@@ -149,6 +170,7 @@ private final class HTTPFixture {
                 }
             }
             if holdOpen { _ = release.wait(timeout: .now() + 5) }
+            }
         }
     }
 
