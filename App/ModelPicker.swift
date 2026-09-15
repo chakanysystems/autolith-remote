@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct ModelPicker: View {
-    @ObservedObject var connection: Connection
+    @Bindable var connection: Connection
     let session: Session
     @Environment(\.dismiss) private var dismiss
     @State private var search = ""

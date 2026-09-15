@@ -29,7 +29,7 @@ final class ConversationScrollStateTests: XCTestCase {
         XCTAssertTrue(state.shouldFollow)
     }
 
-    func testHistoryStartsWithLatestPageAndPreservesStartOnAppend() {
+    func testHistoryStaysBoundedAndPinsWhenReading() {
         var history = ConversationHistoryWindow()
         let ids = (0..<250).map(String.init)
         history.update(ids)
@@ -37,8 +37,15 @@ final class ConversationScrollStateTests: XCTestCase {
 
         let appended = (0..<260).map(String.init)
         history.update(appended)
-        XCTAssertEqual(history.startIndex(in: appended), 150)
-        XCTAssertEqual(history.firstID, "150")
+        XCTAssertEqual(history.startIndex(in: appended), 160)
+        XCTAssertEqual(history.range(in: appended).count, 100)
+        history.setFollowing(false, ids: appended)
+        let later = (0..<1000).map(String.init)
+        history.update(later)
+        XCTAssertEqual(history.startIndex(in: later), 160)
+        XCTAssertEqual(history.range(in: later).count, 100)
+        history.showLatest(later)
+        XCTAssertEqual(history.range(in: later), 900..<1000)
     }
 
     func testEarlierHistoryLoadsOnePageAtATime() {
@@ -49,6 +56,16 @@ final class ConversationScrollStateTests: XCTestCase {
         XCTAssertEqual(history.startIndex(in: ids), 50)
         history.showEarlier(ids)
         XCTAssertEqual(history.startIndex(in: ids), 0)
+        XCTAssertEqual(history.range(in: ids).count, 100)
+        history.setFollowing(true, ids: ids)
+        XCTAssertEqual(history.startIndex(in: ids), 0)
+        history.showNewer(ids)
+        XCTAssertEqual(history.range(in: ids), 100..<200)
+        history.showNewer(ids)
+        XCTAssertEqual(history.range(in: ids), 150..<250)
+        XCTAssertTrue(history.followsLatest)
+        history.showEarlier(ids)
+        XCTAssertEqual(history.startIndex(in: ids), 50)
         history.showEarlier(ids)
         XCTAssertEqual(history.startIndex(in: ids), 0)
     }

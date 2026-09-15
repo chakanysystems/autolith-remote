@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct SessionComposer: View {
-    @ObservedObject var connection: Connection
+    @Bindable var connection: Connection
     let session: Session
     @State private var editRevision = 0
     @State private var selection = NSRange(location: 0, length: 0)

@@ -1,4 +1,5 @@
 import SwiftUI
+import Observation
 import Security
 
 extension Session {
@@ -24,19 +25,19 @@ struct Reply: Codable, Sendable {
     var state: String?; var requestID: String?
 }
 
-@MainActor final class Connection: ObservableObject {
-    @Published var sessions: [Session] = []
-    @Published var events: [String: [Event]] = [:]
-    @Published var drafts: [String: String] = [:]
-    @Published var selection: String? { didSet {
+@MainActor @Observable final class Connection {
+    var sessions: [Session] = []
+    var events: [String: [Event]] = [:]
+    var drafts: [String: String] = [:]
+    var selection: String? { didSet {
         if oldValue != selection {
             restartStream()
             if let id = selection { Task { await self.loadTranscript(id) } }
         }
     } }
-    @Published private(set) var streamStatus = "Live activity disconnected"
-    @Published private(set) var streamConnected = false
-    @Published private(set) var liveEvents: [Event] = []
+    private(set) var streamStatus = "Live activity disconnected"
+    private(set) var streamConnected = false
+    private(set) var liveEvents: [Event] = []
     private var foreground = false
     private var streamTask: Task<Void, Never>?
     private var transcriptTask: Task<Void, Never>?
@@ -46,22 +47,22 @@ struct Reply: Codable, Sendable {
     private var transcriptRefreshedAt: [String: Date] = [:]
     private var stream: SessionStream?
     private var streamGeneration = UUID()
-    @Published var online = false
-    @Published var error: String?
-    @Published private var creatingSession = false
-    @Published private var commands = SessionCommandState()
+    var online = false
+    var error: String?
+    private var creatingSession = false
+    private var commands = SessionCommandState()
     var busy: Bool { creatingSession || selection.map { commands.contains($0) } == true }
     func isBusy(_ id: String) -> Bool { creatingSession || commands.contains(id) }
-    @Published private(set) var host = UserDefaults.standard.string(forKey: "host") ?? ""
-    @Published private(set) var token = ""
-    @Published private(set) var refreshing = false
-    @Published private(set) var loadingTranscript: String?
-    @Published private(set) var loadingCatalog = false
-    @Published var models: [ModelOption] = []
-    @Published var completions: [CompletionOption] = []
-    @Published var catalogError: String?
-    @Published var activityError: String?
-    @Published var activityStatus = "Waiting for session status." {
+    private(set) var host = UserDefaults.standard.string(forKey: "host") ?? ""
+    private(set) var token = ""
+    private(set) var refreshing = false
+    private(set) var loadingTranscript: String?
+    private(set) var loadingCatalog = false
+    var models: [ModelOption] = []
+    var completions: [CompletionOption] = []
+    var catalogError: String?
+    var activityError: String?
+    var activityStatus = "Waiting for session status." {
         didSet { UserDefaults.standard.set(activityStatus, forKey: "liveActivityStatus") }
     }
     let activities = LiveActivityController.shared
@@ -71,7 +72,7 @@ struct Reply: Codable, Sendable {
     var context: ConnectionContext { ConnectionContext(host: host, token: token, generation: generation) }
     func isCurrent(_ captured: ConnectionContext) -> Bool { context == captured }
     private(set) var switching = false
-    private var cached: [String: CachedTranscript] = [:]
+    @ObservationIgnored private var cached: [String: CachedTranscript] = [:]
     private var fetches: [String: Task<Void, Never>] = [:]
     private var sessionEpochs: [String: UUID] = [:]
     private var persistTask: Task<Void, Never>?
@@ -327,6 +328,10 @@ struct Reply: Codable, Sendable {
 
     func presentation(eventID: String, sessionID: String) -> EventPresentation? {
         cached[sessionID]?.presentations[eventID]
+    }
+
+    func eventIdentifiers(for sessionID: String) -> [String] {
+        cached[sessionID]?.eventIDs ?? []
     }
 
     func shareText(for sessionID: String) -> String {

@@ -2,7 +2,7 @@ import SwiftUI
 import AppIntents
 
 struct SiriWorkspaceSettings: View {
-    @ObservedObject var connection: Connection
+    @Bindable var connection: Connection
     @State private var configuration = SiriWorkspaceConfiguration()
     @State private var defaultPath = ""
     @State private var paths: [String] = []

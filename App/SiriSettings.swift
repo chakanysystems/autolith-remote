@@ -11,7 +11,7 @@ import AppIntents
 }
 
 struct SiriSettings: View {
-    @ObservedObject var connection: Connection
+    @Bindable var connection: Connection
     @AppStorage("siriLastAction") private var lastAction = ""
     @AppStorage("siriLastActionDate") private var lastDate = 0.0
     @AppStorage("siriContextError") private var contextError = ""

@@ -10,7 +10,7 @@ import AppIntents
 
 struct SiriNavigation: ViewModifier {
     @ObservedObject private var navigation = SiriNavigationState.shared
-    @ObservedObject var connection: Connection
+    @Bindable var connection: Connection
     @Binding var search: String
     func body(content: Content) -> some View {
         content

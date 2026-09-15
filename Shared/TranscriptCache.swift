@@ -12,6 +12,7 @@ struct CachedTranscript: Codable, Sendable {
     var byteCost: Int? = nil
     var presentations: [String: EventPresentation] = [:]
     var shareText: String = ""
+    var eventIDs: [String] = []
     private enum CodingKeys: String, CodingKey { case revision, events, accessed, byteCost }
     static let memoryLimit = 16 * 1024 * 1024
     static let eventLimit = 10_000
@@ -67,6 +68,7 @@ struct CachedTranscript: Codable, Sendable {
         byteCost = events.reduce(0) { $0 + $1.text.utf8.count * 2 + $1.id.utf8.count + $1.tool.utf8.count + 512 } + shareText.utf8.count
     }
     mutating func preparePresentation(previous: [Event] = []) {
+        eventIDs = events.map(\.id)
         let old = Dictionary(previous.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
         var rendered: [String: EventPresentation] = [:]
         for (index, event) in events.enumerated() {

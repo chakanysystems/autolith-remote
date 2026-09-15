@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct SessionSidebar: View {
-    @ObservedObject var connection: Connection
+    @Bindable var connection: Connection
     let usesListSelection: Bool
     let search: String
     let groupByProject: Bool
