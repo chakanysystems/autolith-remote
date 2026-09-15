@@ -94,7 +94,7 @@ struct ConversationView: View {
                     Label("Session stopped. Your conversation is saved.", systemImage: "stop.circle")
                     Spacer()
                     Button("Resume session") { Task { await connection.resume(session) } }
-                        .disabled(connection.busy || !connection.online)
+                        .disabled(connection.isBusy(session.id) || !connection.online)
                 }.font(.callout).padding()
             }
             ConversationScrollView {
@@ -111,7 +111,7 @@ struct ConversationView: View {
                     ConversationEventView(event: event, presentation: connection.presentation(eventID: event.id, sessionID: session.id),
                                           retryMessage: { outboxAction("message-retry", event: event) },
                                           abandonMessage: { outboxAction("message-abandon", event: event) },
-                                          controlsEnabled: connection.online && !connection.busy)
+                                          controlsEnabled: connection.online && !connection.isBusy(session.id))
                         .modifier(AutolithMessageAnnotation(connection: connection, host: connection.host, sessionID: session.id, event: event))
                         .id(event.id)
                 }
@@ -133,7 +133,7 @@ struct ConversationView: View {
                 Menu {
                     Button("Pause", systemImage: "pause") {
                         Task { _ = await connection.control("pause", id: session.id) }
-                    }.disabled(connection.busy || !connection.online || !session.isRunning)
+                    }.disabled(connection.isBusy(session.id) || !connection.online || !session.isRunning)
                     if session.jobs > 0 { Text("\(session.jobs) jobs") }
                     if session.queued > 0 { Text("\(session.queued) queued") }
                     Text(session.workspace)

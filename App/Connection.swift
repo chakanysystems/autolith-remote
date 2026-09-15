@@ -48,7 +48,10 @@ struct Reply: Codable, Sendable {
     private var streamGeneration = UUID()
     @Published var online = false
     @Published var error: String?
-    @Published var busy = false
+    @Published private var creatingSession = false
+    @Published private var commands = SessionCommandState()
+    var busy: Bool { creatingSession || selection.map { commands.contains($0) } == true }
+    func isBusy(_ id: String) -> Bool { creatingSession || commands.contains(id) }
     @Published private(set) var host = UserDefaults.standard.string(forKey: "host") ?? ""
     @Published private(set) var token = ""
     @Published private(set) var refreshing = false
@@ -111,9 +114,9 @@ struct Reply: Codable, Sendable {
     }
     func updateOutbox(_ operation: String, event: Event, sessionID: String, context captured: ConnectionContext) async {
         let allowed = operation == "message-retry" ? event.canRetryDelivery : operation == "message-abandon" && event.canAbandonDelivery
-        guard isCurrent(captured), !switching, !busy, allowed else { return }
-        busy = true
-        defer { if isCurrent(captured) { busy = false } }
+        guard isCurrent(captured), !switching, !creatingSession, allowed,
+              let command = commands.begin(sessionID) else { return }
+        defer { commands.finish(sessionID, token: command) }
         do {
             let reply = try await call(["operation": operation, "id": sessionID, "eventID": event.id], context: captured)
             guard isCurrent(captured), !Task.isCancelled else { return }
@@ -148,7 +151,7 @@ struct Reply: Codable, Sendable {
         guard previous.host != candidate.host || previous.token != candidate.token else { return }
         // Invalidate in-flight UI work before waiting for old-identity revocation.
         generation += 1
-        refreshing = false; busy = false; loadingTranscript = nil; loadingCatalog = false
+        refreshing = false; commands.clear(); creatingSession = false; loadingTranscript = nil; loadingCatalog = false
         catalogRequest = UUID()
         persistTask?.cancel(); persistTask = nil; maintenanceTask?.cancel(); maintenanceTask = nil
         readTask?.cancel(); readTask = nil
@@ -175,7 +178,7 @@ struct Reply: Codable, Sendable {
         fetches.values.forEach { $0.cancel() }; fetches = [:]; cached = [:]; sessionEpochs = [:]
         stopStream()
         events = [:]; sessions = []; drafts = [:]; online = false
-        refreshing = false; loadingTranscript = nil; busy = false; loadingCatalog = false
+        refreshing = false; loadingTranscript = nil; commands.clear(); creatingSession = false; loadingCatalog = false
         models = []; completions = []; catalogSession = nil; catalogRequest = UUID(); selection = nil
         let saved = context
         try await TranscriptCache.shared.activate(key: TranscriptCache.key(host: saved.host, token: saved.token))
@@ -543,24 +546,24 @@ struct Reply: Codable, Sendable {
         return await control("tell", id: session.id, message: command)
     }
     func control(_ operation: String, id: String, message: String? = nil) async -> Bool {
-        guard !switching, !busy else { return false }
+        guard !switching, !creatingSession, let command = commands.begin(id) else { return false }
         let captured = context
-        busy = true
-        defer { if isCurrent(captured) { busy = false } }
+        defer { commands.finish(id, token: command) }
         do {
             var payload: [String: Any] = ["operation": operation, "id": id]
             if let message { payload["message"] = message }
-            _ = try await call(payload, context: captured)
+            let reply = try await call(payload, context: captured)
+            try SiriMessageReceipt.confirmed(reply.ok)
             guard isCurrent(captured), !Task.isCancelled else { return false }
-            await refresh()
-            return isCurrent(captured) && !Task.isCancelled
+            reconcileAfterCommand(id: id, context: captured)
+            return true
         } catch { if isCurrent(captured) { self.error = error.localizedDescription }; return false }
     }
     func create(workspace: String, permissions: String) async -> Bool {
-        guard !switching, !busy else { return false }
+        guard !switching, !creatingSession else { return false }
         let captured = context
-        busy = true
-        defer { if isCurrent(captured) { busy = false } }
+        creatingSession = true
+        defer { if isCurrent(captured) { creatingSession = false } }
         do {
             let reply = try await call(["operation": "create", "workspace": workspace, "permissions": permissions], context: captured)
             guard isCurrent(captured), !Task.isCancelled else { return false }
@@ -570,10 +573,9 @@ struct Reply: Codable, Sendable {
         } catch { if isCurrent(captured) { self.error = error.localizedDescription }; return false }
     }
     func resume(_ session: Session) async {
-        guard !switching, !busy else { return }
+        guard !switching, !creatingSession, let command = commands.begin(session.id) else { return }
         let captured = context
-        busy = true
-        defer { if isCurrent(captured) { busy = false } }
+        defer { commands.finish(session.id, token: command) }
         do {
             let reply = try await call(["operation": "resume", "id": session.id,
                                         "workspace": session.workspace, "permissions": "ask"], context: captured)
@@ -594,6 +596,18 @@ struct Reply: Codable, Sendable {
             guard isCurrent(captured) else { return }
             scheduleMaintenance()
             if selection == session.id { selection = nil }
+        }
+    }
+
+    /// Acknowledgement releases the composer; authoritative history catches up separately.
+    private func reconcileAfterCommand(id: String, context captured: ConnectionContext) {
+        Task {
+            guard isCurrent(captured) else { return }
+            if let pending = fetches[id] { await pending.value }
+            guard isCurrent(captured), !Task.isCancelled else { return }
+            await loadTranscript(id)
+            guard isCurrent(captured), !Task.isCancelled else { return }
+            await refresh()
         }
     }
 }

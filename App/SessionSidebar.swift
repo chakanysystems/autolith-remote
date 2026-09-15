@@ -34,12 +34,12 @@ struct SessionSidebar: View {
                             .contextMenu {
                                 Button(session.isRunning ? "Stop session before deleting" : "Delete conversation…", systemImage: "trash", role: .destructive) {
                                     requestDeletion(session)
-                                }.disabled(session.isRunning || connection.busy || !connection.online)
+                                }.disabled(session.isRunning || connection.isBusy(session.id) || !connection.online)
                             }
                             .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                                 if !session.isRunning {
                                     Button("Delete", systemImage: "trash", role: .destructive) { requestDeletion(session) }
-                                        .disabled(connection.busy || !connection.online)
+                                        .disabled(connection.isBusy(session.id) || !connection.online)
                                 }
                             }
                     }
