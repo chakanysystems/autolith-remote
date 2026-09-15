@@ -1,5 +1,10 @@
 import Foundation
+#if canImport(Darwin)
 import Darwin
+#else
+import Glibc
+#endif
+import CBridgePOSIX
 import BridgeCore
 
 /// Owns the launcher's process group until it is killed. The leader is deliberately
@@ -16,26 +21,22 @@ final class BackendChild {
     static func prepareReaping() throws { try reapingPreparation.get() }
 
     private static let reapingPreparation: Result<Void, Error> = Result {
-        var action = sigaction()
-        action.__sigaction_u.__sa_handler = SIG_DFL
-        sigemptyset(&action.sa_mask)
-        action.sa_flags = 0
-        guard sigaction(SIGCHLD, &action, nil) == 0 else {
+        guard bridge_prepare_reaping() == 0 else {
             throw BridgeError.invalid("Cannot prepare backend child reaping.")
         }
     }
 
     private static func pipeDescriptors() throws -> [Int32] {
         var descriptors: [Int32] = [-1, -1]
-        guard pipe(&descriptors) == 0 else { throw BridgeError.invalid("Cannot create backend pipe.") }
+        guard bridge_pipe(&descriptors) == 0 else { throw BridgeError.invalid("Cannot create backend pipe.") }
         var succeeded = false
-        defer { if !succeeded { descriptors.forEach { Darwin.close($0) } } }
+        defer { if !succeeded { descriptors.forEach { close($0) } } }
         for index in descriptors.indices {
             let fd = descriptors[index]
             // Sources must never alias spawn's standard-descriptor destinations.
             let moved = fcntl(fd, F_DUPFD_CLOEXEC, 3)
             guard moved >= 0 else { throw BridgeError.invalid("Cannot configure backend pipe.") }
-            Darwin.close(fd)
+            close(fd)
             descriptors[index] = moved
         }
         succeeded = true
@@ -50,23 +51,29 @@ final class BackendChild {
             let null = open("/dev/null", O_WRONLY | O_CLOEXEC)
             guard null >= 0 else { throw BridgeError.invalid("Cannot open backend stderr.") }
             errorOutput = fcntl(null, F_DUPFD_CLOEXEC, 3)
-            Darwin.close(null)
+            close(null)
             guard errorOutput >= 0 else { throw BridgeError.invalid("Cannot configure backend stderr.") }
         }
-        defer { Darwin.close(errorOutput) }
+        defer { close(errorOutput) }
         let incoming = try Self.pipeDescriptors()
         var outgoing: [Int32]
         do { outgoing = try Self.pipeDescriptors() }
-        catch { incoming.forEach { Darwin.close($0) }; throw error }
+        catch { incoming.forEach { close($0) }; throw error }
         var succeeded = false
         defer {
-            Darwin.close(incoming[0]); Darwin.close(outgoing[1])
-            if !succeeded { Darwin.close(incoming[1]); Darwin.close(outgoing[0]) }
+            close(incoming[0]); close(outgoing[1])
+            if !succeeded { close(incoming[1]); close(outgoing[0]) }
         }
-        // CLOEXEC_DEFAULT prevents concurrent launches from inheriting pipe
-        // descriptors during the interval between pipe() and fcntl().
+        #if canImport(Darwin)
+        // Darwin's default-close policy also covers the pipe()/fcntl() interval.
         var actions: posix_spawn_file_actions_t?
         var attributes: posix_spawnattr_t?
+        let flags = Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT)
+        #else
+        var actions = posix_spawn_file_actions_t()
+        var attributes = posix_spawnattr_t()
+        let flags = Int16(POSIX_SPAWN_SETPGROUP)
+        #endif
         guard posix_spawn_file_actions_init(&actions) == 0 else { throw BridgeError.invalid("Cannot prepare backend launch.") }
         defer { posix_spawn_file_actions_destroy(&actions) }
         guard posix_spawnattr_init(&attributes) == 0 else { throw BridgeError.invalid("Cannot prepare backend launch.") }
@@ -74,8 +81,9 @@ final class BackendChild {
         guard posix_spawn_file_actions_adddup2(&actions, incoming[0], STDIN_FILENO) == 0,
               posix_spawn_file_actions_adddup2(&actions, outgoing[1], STDOUT_FILENO) == 0,
               posix_spawn_file_actions_adddup2(&actions, errorOutput, STDERR_FILENO) == 0,
+              bridge_spawn_closefrom(&actions) == 0,
               posix_spawnattr_setpgroup(&attributes, 0) == 0,
-              posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT)) == 0 else {
+              posix_spawnattr_setflags(&attributes, flags) == 0 else {
             throw BridgeError.invalid("Cannot prepare backend launch.")
         }
         var allocated: [UnsafeMutablePointer<CChar>] = []
@@ -100,10 +108,14 @@ final class BackendChild {
         pid = child; input = incoming[1]; output = outgoing[0]
         succeeded = true
         guard fcntl(input, F_SETFL, O_NONBLOCK) != -1,
-              fcntl(input, F_SETNOSIGPIPE, 1) != -1,
               fcntl(output, F_SETFL, O_NONBLOCK) != -1 else {
             stop(); throw BridgeError.invalid("Cannot configure backend pipe.")
         }
+        #if canImport(Darwin)
+        guard fcntl(input, F_SETNOSIGPIPE, 1) != -1 else {
+            stop(); throw BridgeError.invalid("Cannot configure backend SIGPIPE handling.")
+        }
+        #endif
     }
 
     /// Caller must first cancel its queue-confined I/O. No delayed signal can
@@ -113,7 +125,7 @@ final class BackendChild {
         let ownedPID = pid
         pid = 0
         kill(-ownedPID, SIGTERM)
-        closeInput(); Darwin.close(output)
+        closeInput(); close(output)
         // Keep the leader unreaped throughout the grace period, including when
         // it exits before its children. Only reap after the final group signal.
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.25) {
@@ -125,7 +137,7 @@ final class BackendChild {
     func closeInput() {
         guard !inputClosed else { return }
         inputClosed = true
-        Darwin.close(input)
+        close(input)
     }
     deinit { stop() }
 }

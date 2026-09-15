@@ -22,7 +22,7 @@ final class CompanionEndpointTests: XCTestCase {
             "https://mac.example?", "https://mac.example?q=1", "https://mac.example#", "https://mac.example#fragment",
             "https://mac.example:", "https://mac.example:/", "https://mac.example:0", "https://mac.example:65536",
             "https://mac.example:-1", "https://mac.example:abc", "https://mac.example:999999999999999999999999",
-            "https://bad host", "https://bad%20host", "https://mac.example\n.evil"
+            "https://bad host", "https://bad%20host", "https://bad%host", "https://bad<host", "https://mac.example\n.evil"
         ] {
             XCTAssertThrowsError(try CompanionEndpoint.canonical(input), input)
             XCTAssertFalse(CompanionEndpoint.equivalent(input, input), input)

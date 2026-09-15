@@ -18,9 +18,11 @@ Both shared schemes, `Autolith` and `AutolithActivity`, launch the containing ap
 
 Connect Tailscale on the Mac and iPad. In the app, enter your Mac's Tailscale HTTPS address and the companion token. The token is stored in the device-only Keychain. HTTPS certificate validation is enabled; there are no broad transport-security exceptions.
 
-## Mac companion
+## Companion bridge
 
 The Swift companion requires a mobile-enabled Autolith build with `autolith mobile`. It exchanges one JSON request and response per line, or a native activity subscription. The companion verifies `rpc-handshake` protocol version 1 and keeps up to four backend processes warm. Update the backend and companion together. Requests with uncertain delivery are never automatically replayed. It reuses localgroup discovery/control and the read-only conversation replay projection.
+
+Run the bridge on macOS 14+ or Linux with glibc 2.34+. It uses SwiftNIO for loopback TCP, the shared bounded HTTP/WebSocket parsers, and Swift Crypto on Linux. The backend must run on the same host. For a non-Nix build, install a Swift 5.10-compatible toolchain with Clang and its Foundation/Dispatch libraries.
 
 1. Build the companion with `swift build -c release`.
 2. Build a mobile-enabled Autolith checkout with its documented bootstrap or Nix build.
@@ -45,13 +47,13 @@ paused sessions, and sessions with attached terminals are protected. Failed inve
 checks and restarted processes reset the observation period. Older session processes
 without guarded shutdown support are left running until stopped or restarted normally.
 
-The companion binds only `127.0.0.1:4318`. Tailscale Serve supplies private tailnet HTTPS; the companion additionally checks a bearer token. Anyone with both network access and the token can control sessions as the Mac user. Autolith endpoint tokens and provider credentials remain on the Mac. Rotate the companion token by replacing its file and restarting the companion, then updating the iPad.
+The companion binds only `127.0.0.1:4318`. Tailscale Serve supplies private tailnet HTTPS; the companion additionally checks a bearer token. Anyone with both network access and the token can control sessions as the host user. Store provider credentials on the backend host. Rotate the companion token by replacing its file and restarting the companion, then updating the mobile client.
 
-Headers must authenticate within five seconds; authenticated request bodies have fifteen seconds. The bridge reserves separate pending-handshake and authenticated connection capacity. Requests have an overall 65-second deadline, including backend checkout and I/O. Disconnects cancel pending backend work, but a mutation already handed off may have executed. Backend subprocess cleanup covers its process group, not descendants that deliberately detach. Full reply correlation, downstream mutation deduplication, and atomic idle revision/PID checks require backend protocol support.
+Headers must authenticate within five seconds; authenticated request bodies have fifteen seconds. The bridge reserves separate pending-handshake and authenticated connection capacity. Requests have an overall 65-second deadline, including backend checkout and I/O. Transport failures cancel pending backend work, but a mutation already handed off may have executed. A client may half-close its completed HTTP request and read the response. Backend subprocess cleanup covers its process group, not descendants that deliberately detach. Full reply correlation, downstream mutation deduplication, and atomic idle revision/PID checks require backend protocol support.
 
-### Run with Nix on macOS
+### Run with Nix on macOS or Linux
 
-The flake exports `autolith-bridge` as both a package and a command-line app, with default aliases. It supports Apple Silicon (`aarch64-darwin`) and Intel (`x86_64-darwin`) on macOS 14 or later. The package builds the Swift bridge with Nix tools; Xcode is not needed for this build. The iOS app is built separately in Xcode.
+The flake exports `autolith-bridge` as both a package and a command-line app, with default aliases. Supported systems are `aarch64-darwin`, `aarch64-linux`, and `x86_64-linux`. The package builds the Swift bridge with Nix tools. Build the iOS/Mac Catalyst app separately in Xcode.
 
 Enable Nix's `nix-command` and `flakes` features. Set up the backend and private token file as described above, then run:
 
@@ -70,9 +72,11 @@ nix profile add github:chakanysystems/autolith-remote#autolith-bridge
 autolith-bridge
 ```
 
-From a local checkout, use `nix run .`, `nix build .`, or `nix flake check`. The build checks that the installed executable starts and rejects a missing token configuration. Run the full test suite separately with Xcode's `swift test`; Nix's Darwin SwiftPM lacks Apple's XCTest runner. `nix build` puts the executable at `result/bin/autolith-bridge`. Commit `flake.lock` updates to pin the build tools for other users.
+From a local checkout, use `nix run .`, `nix build .`, or `nix flake check`. Linux builds run the full Swift test suite. Every build checks startup of the installed executable without injected library paths or token configuration. Run the macOS suite with Xcode's `swift test`; Nix's Darwin SwiftPM lacks Apple's XCTest runner. `nix build` puts the executable at `result/bin/autolith-bridge`.
 
-Other flakes can use `inputs.autolith-remote.packages.${system}.autolith-bridge`. The derivation in `nix/package.nix` can also be used with `pkgs.callPackage`. To start the installed bridge at login, use a per-user launchd agent and supply absolute backend and token paths in its environment.
+`flake.lock` pins the build tools. `Package.swift` and `Package.resolved` pin Swift 5.10-compatible dependencies; `nix/dependencies` contains their fixed hashes and offline SwiftPM workspace metadata. When updating dependencies, resolve the package graph and regenerate that metadata with the pinned `swiftpm2nix`, then test both platforms.
+
+Other flakes can use `inputs.autolith-remote.packages.${system}.autolith-bridge`. The derivation in `nix/package.nix` can also be used with `pkgs.callPackage`. To start the installed bridge at login, use a per-user launchd agent on macOS or systemd user service on Linux, supplying absolute backend and token paths in its environment.
 
 ## Sessions and permissions
 

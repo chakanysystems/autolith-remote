@@ -1,6 +1,9 @@
 import Foundation
-import Network
-import Security
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 import BridgeCore
 
 // The listener accepts loopback only. Tailscale Serve owns remote HTTPS.
@@ -29,11 +32,9 @@ func authorized(_ authorization: String) -> Bool {
     for index in expected.indices { difference |= Int(expected[index] ^ (index < supplied.count ? supplied[index] : 0)) }
     return difference == 0
 }
-let parameters = NWParameters.tcp
 // Override the loopback port for isolated integration tests or a second companion.
-let port = NWEndpoint.Port(rawValue: UInt16(environment["AUTOLITH_BRIDGE_PORT"] ?? "4318") ?? 4318)!
-parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: port)
-let listener = try NWListener(using: parameters)
+let port = UInt16(environment["AUTOLITH_BRIDGE_PORT"] ?? "4318") ?? 4318
+let listener = BridgeListener(queue: queue)
 
 let pushService = try PushService(environment: environment) {
     try executeAutolith(Data("{\"operation\":\"list\"}".utf8))
@@ -144,7 +145,7 @@ func executeAutolith(_ body: Data, context: BackendRequestContext = BackendReque
 }
 
 final class Client {
-    let connection: NWConnection
+    let connection: BridgeConnection
     let id = UUID()
     let context = BackendRequestContext(deadline: .now() + 65)
     var authenticated = false
@@ -153,13 +154,13 @@ final class Client {
     var finished = false
     var stream: EventStream?
     func disconnected() { context.cancel(); stream?.stop(); stream = nil }
-    init(_ connection: NWConnection) { self.connection = connection }
+    init(_ connection: BridgeConnection) { self.connection = connection }
     func reply(_ status: Int, _ body: Data) {
         guard !finished else { return }; finished = true
         context.cancel()
         data.removeAll()
         let head = "HTTP/1.1 \(status) Response\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
-        connection.send(content: Data(head.utf8) + body, completion: .contentProcessed { _ in self.connection.cancel() })
+        connection.send(Data(head.utf8) + body) { _ in self.connection.cancel() }
     }
     func fail(_ status: Int, _ text: String) { reply(status, (try? JSONSerialization.data(withJSONObject: ["error": text])) ?? Data()) }
     func authenticate(_ authorization: String) -> Bool {
@@ -170,7 +171,7 @@ final class Client {
         return true
     }
     func receive() {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { bytes, _, ended, error in
+        connection.receive { bytes, ended, error in
             guard !self.finished else { return }
             if let bytes { self.data.append(bytes) }
             do {
@@ -199,6 +200,14 @@ final class Client {
                     if let request = try HTTPRequest.parse(self.data) {
                         guard slots.wait(timeout: .now()) == .success else { self.fail(503, "Companion is busy"); return }
                         self.dispatched = true
+                        // Reject a second request or transport failure, but allow
+                        // a client to half-close its request and still read the reply.
+                        self.connection.receive { bytes, _, error in
+                            if error != nil || bytes?.isEmpty == false {
+                                self.context.cancel()
+                                self.connection.cancel()
+                            }
+                        }
                         let context = self.context
                         workers.async {
                             defer { slots.signal() }
@@ -219,23 +228,18 @@ final class Client {
 }
 var admission = ConnectionAdmission()
 var clients: [UUID: Client] = [:]
-listener.newConnectionHandler = { connection in
+try listener.start(port: port) { connection in
     let client = Client(connection)
     if let evicted = admission.admit(client.id), let previous = clients.removeValue(forKey: evicted) {
         previous.connection.cancel()
     }
     clients[client.id] = client
-    connection.stateUpdateHandler = { state in
-        switch state {
-        case .cancelled:
-            admission.remove(client.id)
-            clients.removeValue(forKey: client.id)
-            client.disconnected(); connection.stateUpdateHandler = nil
-        case .failed: client.disconnected(); connection.cancel()
-        default: break
-        }
+    connection.onClose = {
+        admission.remove(client.id)
+        clients.removeValue(forKey: client.id)
+        client.disconnected()
+        connection.onClose = nil
     }
-    connection.start(queue: queue)
     client.receive()
     queue.asyncAfter(deadline: .now() + 5) { [weak client] in
         if let client, !client.finished, !client.authenticated { client.fail(408, "Authentication handshake timed out") }
@@ -249,9 +253,5 @@ listener.newConnectionHandler = { connection in
         }
     }
 }
-listener.stateUpdateHandler = { state in
-    if case .failed(let error) = state { fputs("Listener failed: \(error)\n", stderr); exit(1) }
-    if case .ready = state { print("Autolith companion listening on 127.0.0.1:\(listener.port?.rawValue ?? port.rawValue). Expose with Tailscale Serve HTTPS.") }
-}
-listener.start(queue: queue)
+print("Autolith companion listening on 127.0.0.1:\(listener.port ?? Int(port)). Expose with Tailscale Serve HTTPS.")
 dispatchMain()

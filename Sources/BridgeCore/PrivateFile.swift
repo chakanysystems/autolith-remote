@@ -38,7 +38,13 @@ public enum PrivateFile {
     /// resolved before a descriptor-relative walk that rejects writable ancestors.
     public static func openDirectory(_ url: URL) throws -> Int32 {
         guard url.isFileURL else { throw BridgeError.invalid("Expected a private directory.") }
-        let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+        // Foundation preserves some Darwin aliases (notably /var) even after
+        // resolvingSymlinksInPath. Use libc's physical path before the no-follow walk.
+        guard let resolved = realpath(url.path, nil) else {
+            throw BridgeError.invalid("Could not resolve the private directory.")
+        }
+        defer { free(resolved) }
+        let path = String(cString: resolved)
         guard path.hasPrefix("/") else { throw BridgeError.invalid("Expected an absolute directory.") }
         var descriptor = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         guard descriptor >= 0 else { throw BridgeError.invalid("Could not open the filesystem root.") }
@@ -91,6 +97,15 @@ public enum PrivateFile {
             position = ACL_NEXT_ENTRY
         }
         guard errno == EINVAL else { throw BridgeError.invalid("Could not inspect credential access controls.") }
+        #else
+        // Linux POSIX access ACLs cannot override these mode checks: st_mode's
+        // group bits are the ACL_MASK, which limits every named user and group.
+        // 0600/0700 therefore grant access only to the owner; an ancestor without
+        // group/other write cannot be modified through a named ACL entry either.
+        // Sticky ancestors protect owned children even when that mask permits
+        // writes. Default ACLs affect creation, not access, and newly created
+        // files are restricted to 0600 and validated before use.
+        // This relies on Linux POSIX ACL semantics, not Darwin's allow/deny ACLs.
         #endif
     }
 }

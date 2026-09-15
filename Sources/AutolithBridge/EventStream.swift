@@ -1,12 +1,16 @@
 import Foundation
-import Network
 import BridgeCore
+import CBridgePOSIX
 import CoreFoundation
+#if canImport(Darwin)
 import Darwin
+#else
+import Glibc
+#endif
 
 /// A single authenticated subscription. All mutable state belongs to the listener queue.
 final class EventStream {
-    private let connection: NWConnection
+    private let connection: BridgeConnection
     private let queue: DispatchQueue
     private let executable: String
     private let onClose: () -> Void
@@ -28,7 +32,7 @@ final class EventStream {
     private var epoch = ""
     private var sequence = 0
 
-    init(connection: NWConnection, queue: DispatchQueue, executable: String, onClose: @escaping () -> Void) {
+    init(connection: BridgeConnection, queue: DispatchQueue, executable: String, onClose: @escaping () -> Void) {
         self.connection = connection; self.queue = queue; self.executable = executable; self.onClose = onClose
     }
 
@@ -54,7 +58,7 @@ final class EventStream {
 
     private func receive() {
         guard !closing else { return }
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [self] data, _, ended, error in
+        connection.receive { [self] data, ended, error in
             guard !closing else { return }
             if let data { consume(data) }
             if ended || error != nil { stop() } else { receive() }
@@ -108,7 +112,7 @@ final class EventStream {
         writer.setEventHandler { [weak self] in
             guard let self, !self.closing else { return }
             let count = request.withUnsafeBytes {
-                Darwin.write(child.input, $0.baseAddress!.advanced(by: offset), $0.count - offset)
+                bridge_write(child.input, $0.baseAddress!.advanced(by: offset), $0.count - offset)
             }
             if count < 0 && (errno == EAGAIN || errno == EINTR) { return }
             guard count > 0 else { self.fail("Could not start subscription."); return }
@@ -123,7 +127,7 @@ final class EventStream {
         reader.setEventHandler { [weak self] in
             guard let self, !self.closing else { return }
             var buffer = [UInt8](repeating: 0, count: 65536)
-            let count = Darwin.read(child.output, &buffer, buffer.count)
+            let count = read(child.output, &buffer, buffer.count)
             if count < 0 && (errno == EAGAIN || errno == EINTR) { return }
             if count > 0 { self.consumeOutput(Data(buffer.prefix(count))); return }
             if count < 0 { self.fail("Backend stream read failed."); return }
@@ -196,10 +200,10 @@ final class EventStream {
         guard !closed else { return }
         guard pendingBytes + data.count <= 2_097_152 else { stop(); return }
         pendingBytes += data.count
-        connection.send(content: data, completion: .contentProcessed { [self] error in
+        connection.send(data) { [self] error in
             pendingBytes -= data.count
             if error != nil || (closing && pendingBytes == 0) { stop() }
-        })
+        }
     }
 
     private func fail(_ message: String) {
