@@ -1,5 +1,9 @@
 import Foundation
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
 
 /// Shared by local requests and remote payloads. Length-framed fields avoid
 /// delimiter collisions; the SHA-256 hex value fits APNs' 64-byte collapse limit.

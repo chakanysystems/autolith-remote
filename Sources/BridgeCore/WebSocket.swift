@@ -1,5 +1,9 @@
 import Foundation
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
 
 /// A validated HTTP upgrade. Validate `authorization` before sending `response`.
 /// Pass bytes after `consumedBytes` to the frame decoder. No extensions are negotiated.

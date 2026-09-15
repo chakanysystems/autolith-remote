@@ -1,5 +1,9 @@
 import Foundation
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
 
 /// Content revisions include edits, removals, ordering, pending sends, and read receipts.
 final class TranscriptService: @unchecked Sendable {

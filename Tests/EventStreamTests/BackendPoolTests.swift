@@ -1,5 +1,9 @@
 import XCTest
+#if canImport(Darwin)
 import Darwin
+#else
+import Glibc
+#endif
 @testable import AutolithBridge
 
 final class BackendPoolTests: XCTestCase {
@@ -7,7 +11,7 @@ final class BackendPoolTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let executable = directory.appendingPathComponent("backend")
-        try ("#!/bin/sh\n" + script).write(to: executable, atomically: true, encoding: .utf8)
+        try ("#!\(try fixtureShellPath())\n" + script).write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
         return executable
     }
@@ -39,16 +43,14 @@ final class BackendPoolTests: XCTestCase {
     }
 
     func testDisposingPoolTerminatesLauncherChildren() throws {
-        let executable = try fixture("read -r handshake\nprintf '%s\\n' '{\"rpcProtocol\":1}'\n/bin/sleep 30 &\nchild=$!\nwhile read -r request; do printf '{\"child\":%s}\\n' \"$child\"; done\nwait\n")
+        let executable = try fixture("read -r handshake\nprintf '%s\\n' '{\"rpcProtocol\":1}'\n\(fixtureSleepPath()) 30 &\nchild=$!\nwhile read -r request; do printf '{\"child\":%s}\\n' \"$child\"; done\nwait\n")
         defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
         var pool: BackendPool? = BackendPool(executable: executable.path)
         let result = try JSONSerialization.jsonObject(with: pool!.call(Data(#"{"operation":"list"}"#.utf8))) as! [String: Int32]
         let child = try XCTUnwrap(result["child"])
         XCTAssertEqual(kill(child, 0), 0)
         pool = nil
-        let deadline = Date().addingTimeInterval(5)
-        while kill(child, 0) == 0 && Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
-        XCTAssertEqual(kill(child, 0), -1)
+        try assertProcessTerminates(child, timeout: 5)
     }
 
     func testStopAllowsTermHandlerBeforeForcedCleanup() throws {
@@ -64,17 +66,19 @@ final class BackendPoolTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: executable.path + ".stopped"))
     }
     func testHandshakeAndRequestShareDeadline() throws {
-        let executable = try fixture("read -r handshake\nsleep 0.15\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\nprintf '%s\\n' \"$request\" > \"$0.received\"\nsleep 0.4\nprintf '%s\\n' '{\"ok\":true}'\n")
+        // Each phase fits a fresh one-second budget, but their sum does not.
+        // Leave room for process startup so the test reaches the request phase.
+        let executable = try fixture("read -r handshake\n\(fixtureSleepPath()) 0.4\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\nprintf '%s\\n' \"$request\" > \"$0.received\"\n\(fixtureSleepPath()) 0.8\nprintf '%s\\n' '{\"ok\":true}'\n")
         defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
         let pool = BackendPool(executable: executable.path)
         let start = ProcessInfo.processInfo.systemUptime
-        XCTAssertThrowsError(try pool.call(Data(#"{"operation":"tell"}"#.utf8), deadline: .now() + 0.3))
-        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 0.5)
+        XCTAssertThrowsError(try pool.call(Data(#"{"operation":"tell"}"#.utf8), deadline: .now() + 1))
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 1.2)
         XCTAssertTrue(FileManager.default.fileExists(atPath: executable.path + ".received"))
     }
 
     func testCancelledHandshakeNeverDispatchesMutation() throws {
-        let executable = try fixture("read -r handshake\nprintf 'started' > \"$0.started\"\nsleep 1\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\nprintf '%s\\n' \"$request\" > \"$0.received\"\n")
+        let executable = try fixture("read -r handshake\nprintf 'started' > \"$0.started\"\n\(fixtureSleepPath()) 1\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\nprintf '%s\\n' \"$request\" > \"$0.received\"\n")
         defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
         let pool = BackendPool(executable: executable.path)
         let context = BackendRequestContext(deadline: .now() + 5)
@@ -95,7 +99,7 @@ final class BackendPoolTests: XCTestCase {
     }
 
     func testExpiredPoolWaiterIsNeverDispatched() throws {
-        let executable = try fixture("read -r handshake\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\nprintf '%s\\n' \"$request\" >> \"$0.received\"\nsleep 2\nprintf '%s\\n' '{\"ok\":true}'\n")
+        let executable = try fixture("read -r handshake\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\nprintf '%s\\n' \"$request\" >> \"$0.received\"\n\(fixtureSleepPath()) 2\nprintf '%s\\n' '{\"ok\":true}'\n")
         defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
         let pool = BackendPool(executable: executable.path)
         let contexts = (0..<4).map { _ in BackendRequestContext(deadline: .now() + 5) }
@@ -137,14 +141,14 @@ final class BackendPoolTests: XCTestCase {
 
     func testRejectsExtraReplyAndPartialSurplus() throws {
         for extra in ["{\"stale\":true}\\n", "partial"] {
-            let executable = try fixture("read -r handshake\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\nprintf '{\"ok\":true}\\n" + extra + "'\nsleep 2\n")
+            let executable = try fixture("read -r handshake\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\nprintf '{\"ok\":true}\\n" + extra + "'\n\(fixtureSleepPath()) 2\n")
             defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
             XCTAssertThrowsError(try BackendPool(executable: executable.path).call(Data(#"{"operation":"list"}"#.utf8)))
         }
     }
 
     func testRejectsLateIdleOutputBeforeNextDispatch() throws {
-        let executable = try fixture("read -r handshake\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\nprintf '%s\\n' '{\"ok\":true}'\nsleep 0.1\nprintf '%s\\n' '{\"stale\":true}'\nprintf ready > \"$0.ready\"\nread -r request\nprintf '%s\\n' \"$request\" > \"$0.received\"\n")
+        let executable = try fixture("read -r handshake\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\nprintf '%s\\n' '{\"ok\":true}'\n\(fixtureSleepPath()) 0.1\nprintf '%s\\n' '{\"stale\":true}'\nprintf ready > \"$0.ready\"\nread -r request\nprintf '%s\\n' \"$request\" > \"$0.received\"\n")
         defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
         let pool = BackendPool(executable: executable.path)
         _ = try pool.call(Data(#"{"operation":"list"}"#.utf8))
@@ -156,13 +160,11 @@ final class BackendPoolTests: XCTestCase {
     }
 
     func testExitedLauncherDescendantsAreKilledOnTimeout() throws {
-        let executable = try fixture("read -r handshake\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\n/bin/sleep 30 &\nprintf '%s' \"$!\" > \"$0.child\"\nexit 0\n")
+        let executable = try fixture("read -r handshake\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\n\(fixtureSleepPath()) 30 &\nprintf '%s' \"$!\" > \"$0.child\"\nexit 0\n")
         defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
         let pool = BackendPool(executable: executable.path)
         XCTAssertThrowsError(try pool.call(Data(#"{"operation":"list"}"#.utf8), deadline: .now() + 0.3))
         let pid = try XCTUnwrap(Int32(String(contentsOfFile: executable.path + ".child")))
-        let limit = Date().addingTimeInterval(2)
-        while kill(pid, 0) == 0 && Date() < limit { Thread.sleep(forTimeInterval: 0.01) }
-        XCTAssertEqual(kill(pid, 0), -1)
+        try assertProcessTerminates(pid, timeout: 2)
     }
 }

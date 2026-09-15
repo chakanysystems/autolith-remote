@@ -12,8 +12,15 @@ enum CompanionEndpoint {
 
     static func canonical(_ input: String) throws -> String {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        #if canImport(Darwin)
+        let parsedURL = URL(string: text, encodingInvalidCharacters: false)
+        #else
+        // Swift-corelibs lacks the strict initializer. Reject any implicit escaping.
+        let candidate = URL(string: text)
+        let parsedURL = candidate?.absoluteString == text ? candidate : nil
+        #endif
         guard text.rangeOfCharacter(from: .controlCharacters) == nil,
-              let url = URL(string: text, encodingInvalidCharacters: false),
+              let url = parsedURL,
               var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               components.scheme?.lowercased() == "https",
               let host = components.host, !host.isEmpty,

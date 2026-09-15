@@ -1,5 +1,10 @@
 import Foundation
+#if canImport(Darwin)
 import Darwin
+#else
+import Glibc
+#endif
+import CBridgePOSIX
 import CoreFoundation
 import BridgeCore
 
@@ -95,7 +100,7 @@ private final class BackendWorker {
             while offset < bytes.count {
                 try wait(child.input, event: Int16(POLLOUT), context: context)
                 let written = try context.whileActive {
-                    Darwin.write(child.input, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+                    bridge_write(child.input, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
                 }
                 if written < 0 && (errno == EINTR || errno == EAGAIN) { continue }
                 guard written > 0 else { throw BridgeError.invalid("Backend disconnected. Check the conversation before retrying a mutation.") }
@@ -114,7 +119,7 @@ private final class BackendWorker {
                     var extra: Int
                     repeat {
                         try context.check()
-                        extra = Darwin.read(child.output, &byte, 1)
+                        extra = read(child.output, &byte, 1)
                     } while extra < 0 && errno == EINTR
                     guard buffered.isEmpty, extra == 0 || (extra < 0 && errno == EAGAIN) else {
                         throw BridgeError.invalid("Unsolicited backend output.")
@@ -129,7 +134,7 @@ private final class BackendWorker {
             guard buffered.count <= 8_000_000 else { throw BridgeError.invalid("Backend response exceeds the size limit.") }
             try wait(child.output, event: Int16(POLLIN), context: context)
             var bytes = [UInt8](repeating: 0, count: 65536)
-            let length = Darwin.read(child.output, &bytes, bytes.count)
+            let length = read(child.output, &bytes, bytes.count)
             if length < 0 && (errno == EINTR || errno == EAGAIN) { continue }
             guard length > 0 else { throw BridgeError.invalid("Backend disconnected. Check the conversation before retrying a mutation.") }
             buffered.append(contentsOf: bytes.prefix(length))

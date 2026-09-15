@@ -1,5 +1,12 @@
 import Foundation
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import ClientCore
 import BridgeCore
 
@@ -148,7 +155,7 @@ final class PushService: @unchecked Sendable {
         request.setValue(type == "alert" ? "10" : "5", forHTTPHeaderField: "apns-priority")
         if let collapseID { request.setValue(collapseID, forHTTPHeaderField: "apns-collapse-id") }
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        let (_, response) = try await URLSession.shared.data(for: request)
-        return (response as? HTTPURLResponse)?.statusCode ?? 0
+        let (_, response) = try await BoundedHTTP.data(for: request, limit: 65536)
+        return response.statusCode
     }
 }

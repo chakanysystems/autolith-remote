@@ -6,6 +6,10 @@ public enum WorkspaceBrowser {
         let directory = path.map { URL(fileURLWithPath: $0) } ?? manager.homeDirectoryForCurrentUser
         guard path == nil || path!.hasPrefix("/") else { throw CocoaError(.fileReadInvalidFileName) }
         let resolved = directory.standardizedFileURL.resolvingSymlinksInPath()
+        let attributes = try manager.attributesOfItem(atPath: resolved.path)
+        guard attributes[.type] as? FileAttributeType == .typeDirectory else {
+            throw CocoaError(.fileReadInvalidFileName)
+        }
         let children = try manager.contentsOfDirectory(at: resolved, includingPropertiesForKeys: [.isDirectoryKey, .isPackageKey], options: [.skipsHiddenFiles])
         let folders = try children.filter {
             let values = try $0.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])

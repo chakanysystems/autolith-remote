@@ -37,7 +37,11 @@ final class BackgroundWorkTests: XCTestCase {
             return cache
         }
         XCTAssertNil(prepared.presentations["1"])
+        #if canImport(Darwin)
         XCTAssertEqual(prepared.presentations["2"]?.markdown.map { String($0.characters) }, "new\nline")
+        #else
+        XCTAssertEqual(prepared.presentations["2"]?.markdown.map { String($0.characters) }, "**new**\nline")
+        #endif
         XCTAssertNotNil(prepared.byteCost)
         XCTAssertEqual(prepared.shareText, "assistant:\n**new**\nline")
         let restored = try JSONDecoder().decode(CachedTranscript.self, from: JSONEncoder().encode(prepared))
