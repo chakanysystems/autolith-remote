@@ -2,6 +2,40 @@
 
 A native SwiftUI client for Autolith on your Mac, with iPad sidebar navigation, live session status, search, durable conversation history, tool details, message drafts, and create/pause/stop controls. It also supports iPhone. Requires iOS 18 or later.
 
+## Quick start
+
+On the backend host, install Autolith 0.49.0 or newer and configure your provider credentials. Make sure `autolith` is on `PATH`. Install Nix with `nix-command` and `flakes` enabled, and connect the host and your iPhone or iPad to the same Tailscale network.
+
+### 1. Install the bridge
+
+Install into your user profile with [`nix profile add`](https://nix.dev/manual/nix/2.30/command-ref/new-cli/nix3-profile-add.html):
+
+\```sh
+nix profile add github:chakanysystems/autolith-remote#autolith-bridge
+\```
+
+### 2. Start it
+
+\```sh
+autolith-bridge
+\```
+
+On first launch, the bridge generates a random companion token and prints its file location. By default, it uses `$HOME/.local/state/autolith-bridge/token`, or `$XDG_STATE_HOME/autolith-bridge/token` when `XDG_STATE_HOME` is set. It reuses the token on later launches. The token file has mode 0600 inside a private mode-0700 directory.
+
+The bridge also creates its separate management credentials and starts Autolith. Leave it running in this terminal. To select a backend executable explicitly, run `AUTOLITH_EXECUTABLE=/absolute/path/to/autolith autolith-bridge`.
+
+### 3. Connect the app
+
+In another terminal, expose the loopback listener through [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve):
+
+\```sh
+tailscale serve --bg http://127.0.0.1:4318
+\```
+
+Copy the HTTPS address printed by Tailscale into the app's server address field. Open the token file at the location printed by the bridge and paste its contents into the app's token field. Connect from the app to view and create sessions.
+
+If you already have a companion token, start with `AUTOLITH_BRIDGE_TOKEN_FILE=/absolute/path/to/token autolith-bridge`. That file must already exist with mode 0600 inside an owned mode-0700 directory.
+
 ## License
 
 Copyright 2026 Jack Chakany. Licensed under the [Apache License, Version 2.0](LICENSE).
@@ -23,15 +57,7 @@ Connect Tailscale on the Mac and iPad. In the app, enter your Mac's Tailscale HT
 Run the bridge on macOS 14+ or Linux with glibc 2.34+. It uses SwiftNIO for loopback TCP, bounded HTTP/WebSocket parsers, and Swift Crypto on Linux. Run the backend on the same host. For a non-Nix build, install a Swift 5.10-compatible toolchain with Clang and Foundation/Dispatch libraries.
 The companion connects to Autolith's HMAC-authenticated management REPL over a private Unix socket. It sends bounded lexical Lisp requests that call session and replay functions. Use Autolith 0.49.0 or newer. Requests with uncertain delivery are never automatically replayed.
 
-1. Install Autolith 0.49.0 or newer on `PATH`. To use a specific build, set `AUTOLITH_EXECUTABLE` to its absolute path.
-2. Build the companion with `swift build -c release`, or install it with Nix below. When copying a SwiftPM build, include `AutolithCompanion_AutolithBridge.bundle` on macOS or `AutolithCompanion_AutolithBridge.resources` on Linux beside the executable.
-3. Set `AUTOLITH_BRIDGE_TOKEN_FILE` to your existing phone-facing token: an owned mode-0600 file containing at least 32 random characters, inside an owned mode-0700 directory.
-4. Start the bridge:
-
-   ```sh
-   export AUTOLITH_BRIDGE_TOKEN_FILE="$HOME/.local/state/autolith-bridge/token"
-   autolith-bridge
-   ```
+Follow the [quick start](#quick-start) for installation and pairing. To build without Nix, run `swift build -c release` and start `.build/release/autolith-bridge`. When copying a SwiftPM build, include `AutolithCompanion_AutolithBridge.bundle` on macOS or `AutolithCompanion_AutolithBridge.resources` on Linux beside the executable.
 
 The bridge creates a separate management token and starts a dedicated Autolith process. It waits up to 30 seconds for an authenticated connection before opening the HTTP listener. The management files are stored in `gateway/` beside the companion token. Keep that directory and `management-endpoints.json` to retain access to running sessions across bridge restarts.
 
@@ -55,27 +81,17 @@ Headers must authenticate within five seconds; authenticated request bodies have
 
 The flake exports `autolith-bridge` as both a package and a command-line app, with default aliases. Supported systems are `aarch64-darwin`, `aarch64-linux`, and `x86_64-linux`. The package builds the Swift bridge with Nix tools. Build the iOS/Mac Catalyst app separately in Xcode.
 
-Enable Nix's `nix-command` and `flakes` features. Set up the backend and private token file as described above, then run:
+To run without installing into your profile:
 
-```sh
-export AUTOLITH_BRIDGE_TOKEN_FILE="$HOME/.local/state/autolith-bridge/token"
+\```sh
 nix run github:chakanysystems/autolith-remote#autolith-bridge
-```
+\```
 
-The bridge runs in the foreground and starts its own management gateway. Install the Autolith backend separately. Run Tailscale Serve as described above to connect the mobile client.
-
-To install the bridge into your Nix profile:
-
-```sh
-nix profile add github:chakanysystems/autolith-remote#autolith-bridge
-autolith-bridge
-```
-
-From a local checkout, use `nix run .`, `nix build .`, or `nix flake check`. Linux builds run the full Swift test suite. Every build checks startup of the installed executable without injected library paths or token configuration. Run the macOS suite with Xcode's `swift test`; Nix's Darwin SwiftPM lacks Apple's XCTest runner. `nix build` puts the executable at `result/bin/autolith-bridge`.
+From a local checkout, use `nix run .`, `nix build .`, or `nix flake check`. Linux builds run the full Swift test suite. Every build checks startup of the installed executable without injected library paths. Run the macOS suite with Xcode's `swift test`; Nix's Darwin SwiftPM lacks Apple's XCTest runner. `nix build` puts the executable at `result/bin/autolith-bridge`.
 
 `flake.lock` pins the build tools. `Package.swift` and `Package.resolved` pin Swift 5.10-compatible dependencies; `nix/dependencies` contains their fixed hashes and offline SwiftPM workspace metadata. When updating dependencies, resolve the package graph and regenerate that metadata with the pinned `swiftpm2nix`, then test both platforms.
 
-Other flakes can use `inputs.autolith-remote.packages.${system}.autolith-bridge`. The derivation in `nix/package.nix` can also be used with `pkgs.callPackage`. To start the installed bridge at login, use a per-user launchd agent on macOS or systemd user service on Linux. Supply the companion token path and, if needed, `AUTOLITH_EXECUTABLE` in its environment.
+Other flakes can use `inputs.autolith-remote.packages.${system}.autolith-bridge`. The derivation in `nix/package.nix` can also be used with `pkgs.callPackage`. To start the installed bridge at login, use a per-user launchd agent on macOS or systemd user service on Linux. Set `AUTOLITH_EXECUTABLE` in its environment if the backend is not on the service's `PATH`.
 
 ## Sessions and permissions
 

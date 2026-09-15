@@ -9,15 +9,17 @@ import BridgeCore
 // The listener accepts loopback only. Tailscale Serve owns remote HTTPS.
 let environment = ProcessInfo.processInfo.environment
 let transcripts = TranscriptService()
-guard let tokenPath = environment["AUTOLITH_BRIDGE_TOKEN_FILE"] else {
-    fputs("Set AUTOLITH_BRIDGE_TOKEN_FILE to a private file containing a random token.\n", stderr); exit(64)
+func configureToken() -> BridgeToken {
+    do { return try BridgeToken(environment: environment) }
+    catch {
+        fputs("Cannot configure bridge token: \(error.localizedDescription)\n", stderr)
+        exit(64)
+    }
 }
-let tokenData = try PrivateFile.readSecret(at: URL(fileURLWithPath: tokenPath))
-guard let tokenText = String(data: tokenData, encoding: .utf8) else {
-    fputs("Token file must contain UTF-8 text.\n", stderr); exit(64)
-}
-let token = tokenText.trimmingCharacters(in: .whitespacesAndNewlines)
-guard token.utf8.count >= 32 else { fputs("Token must contain at least 32 random characters.\n", stderr); exit(64) }
+let credential = configureToken()
+let tokenPath = credential.file.path
+let token = credential.value
+fputs("Bridge token file: \(tokenPath)\n", stderr)
 func makeManagedBackend() -> ManagedBackend {
     do {
         return try ManagedBackend(environment: environment,

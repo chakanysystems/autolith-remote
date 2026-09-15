@@ -61,7 +61,7 @@ final class ManagedBackend {
             }
             lockDescriptor = lock
             do {
-                try Self.createToken(directory: descriptor)
+                try PrivateFile.createRandomToken(directory: descriptor)
                 let bytes = try PrivateFile.readSecret(at: URL(fileURLWithPath: tokenPath), maximumBytes: 4096)
                 guard !bytes.isEmpty else { throw BridgeError.invalid("The management token is empty.") }
             } catch { close(lock); lockDescriptor = -1; throw error }
@@ -175,29 +175,4 @@ final class ManagedBackend {
         return path
     }
 
-    private static func createToken(directory: Int32) throws {
-        let descriptor = openat(directory, "token", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        if descriptor < 0 {
-            if errno == EEXIST { return }
-            throw BridgeError.invalid("Cannot create the management token.")
-        }
-        var complete = false
-        defer {
-            close(descriptor)
-            if !complete { unlinkat(directory, "token", 0) }
-        }
-        var random = SystemRandomNumberGenerator()
-        let bytes = (0..<32).map { _ in UInt8.random(in: .min ... .max, using: &random) }
-        try bytes.withUnsafeBytes { buffer in
-            var offset = 0
-            while offset < buffer.count {
-                let count = write(descriptor, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
-                if count < 0 && errno == EINTR { continue }
-                guard count > 0 else { throw BridgeError.invalid("Cannot write the management token.") }
-                offset += count
-            }
-        }
-        guard fsync(descriptor) == 0 else { throw BridgeError.invalid("Cannot save the management token.") }
-        complete = true
-    }
 }
