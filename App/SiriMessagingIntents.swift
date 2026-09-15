@@ -28,7 +28,7 @@ import GeoToolbox
         guard let path = SiriWorkspaceConfiguration.load(host: connection.host).defaultPath else {
             throw connection.failure("Choose a default workspace in Autolith Settings, or ask Autolith a question first.")
         }
-        guard let id = try await connection.call(["operation": "create", "workspace": path, "permissions": "ask"]).id else { throw connection.failure("The Mac did not return a conversation ID.") }
+        guard let id = try await connection.call(["operation": "create", "workspace": path, "permissions": "ask"]).id else { throw connection.failure("The computer did not return a conversation ID.") }
         SiriConversationMemory.remember(id: id, host: connection.host)
         return (connection, Session(id: id, title: "Siri conversation", state: "starting", workspace: path, model: "", permissions: "ask", queued: 0, jobs: 0, updatedAt: Date().timeIntervalSince1970))
     }
@@ -37,7 +37,7 @@ import GeoToolbox
         let id = CompanionEndpoint.canonicalEntityID(contact.id)
         if id == connection.host { return nil }
         let prefix = connection.host + "#session:"
-        guard id.hasPrefix(prefix) else { throw connection.failure("Choose an Autolith recipient on the connected Mac.") }
+        guard id.hasPrefix(prefix) else { throw connection.failure("Choose an Autolith recipient on the connected computer.") }
         return String(id.dropFirst(prefix.count))
     }
 
@@ -52,7 +52,7 @@ import GeoToolbox
 
     static func identity(_ message: AutolithMessageEntity, connection: Connection) throws -> SiriMessageIdentity {
         guard let identity = SiriMessageIdentity(id: message.id), identity.host == connection.host,
-              identity.sessionID == message.conversation.sessionID else { throw connection.failure("That message belongs to another Mac or conversation.") }
+              identity.sessionID == message.conversation.sessionID else { throw connection.failure("That message belongs to another computer or conversation.") }
         return identity
     }
 }

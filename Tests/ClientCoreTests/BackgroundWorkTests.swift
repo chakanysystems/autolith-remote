@@ -49,7 +49,7 @@ final class BackgroundWorkTests: XCTestCase {
     }
 
     func testIndexPlanHandlesRewritesDeletionsAndEvictedTranscripts() async throws {
-        let host = "https://mac.example"
+        let host = "https://computer.example"
         let session = Session(id: "s", title: "Test", state: "idle", workspace: "/test", model: "test", permissions: "ask", queued: 0, jobs: 0, updatedAt: 100)
         let old = Event(id: "1", role: "assistant", tool: "", text: "old", timestamp: 100)
         let removed = Event(id: "2", role: "assistant", tool: "", text: "deleted", timestamp: 101)

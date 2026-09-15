@@ -1,39 +1,29 @@
 import Foundation
 import BridgeCore
-import CBridgePOSIX
 import CoreFoundation
-#if canImport(Darwin)
-import Darwin
-#else
-import Glibc
-#endif
 
 /// A single authenticated subscription. All mutable state belongs to the listener queue.
 final class EventStream {
     private let connection: BridgeConnection
     private let queue: DispatchQueue
-    private let executable: String
+    private let backend: BackendPool
     private let onClose: () -> Void
     private var decoder = WebSocketDecoder(maximumMessageBytes: 8192)
-    private var process: BackendChild?
-    private var reader: DispatchSourceRead?
-    private var writer: DispatchSourceWrite?
-    private var pipeCancellation: DispatchGroup?
+    private var pollTimer: DispatchSourceTimer?
+    private var pollInFlight = false
     private var timer: DispatchSourceTimer?
     private var subscribed = false
     private var closed = false
     private var closing = false
     private var pendingBytes = 0
-    private var lineBuffer = Data()
-    private var preambleBytes = 0
     private var receivedEnvelope = false
     private var lastPong = DispatchTime.now().uptimeNanoseconds
     private var sessionID = ""
     private var epoch = ""
     private var sequence = 0
 
-    init(connection: BridgeConnection, queue: DispatchQueue, executable: String, onClose: @escaping () -> Void) {
-        self.connection = connection; self.queue = queue; self.executable = executable; self.onClose = onClose
+    init(connection: BridgeConnection, queue: DispatchQueue, backend: BackendPool, onClose: @escaping () -> Void) {
+        self.connection = connection; self.queue = queue; self.backend = backend; self.onClose = onClose
     }
 
     func start(response: Data, remainder: Data) {
@@ -102,66 +92,52 @@ final class EventStream {
         sessionID = object["id"] as! String
         epoch = object["epoch"] as? String ?? ""
         subscribed = true
-        let child = try BackendChild(executable: executable)
-        self.process = child
-        let request = try JSONSerialization.data(withJSONObject: object) + Data([10])
-        let cancellation = DispatchGroup()
-        pipeCancellation = cancellation
-        let writer = DispatchSource.makeWriteSource(fileDescriptor: child.input, queue: queue)
-        var offset = 0
-        writer.setEventHandler { [weak self] in
-            guard let self, !self.closing else { return }
-            let count = request.withUnsafeBytes {
-                bridge_write(child.input, $0.baseAddress!.advanced(by: offset), $0.count - offset)
-            }
-            if count < 0 && (errno == EAGAIN || errno == EINTR) { return }
-            guard count > 0 else { self.fail("Could not start subscription."); return }
-            offset += count
-            if offset == request.count { self.writer?.cancel(); self.writer = nil }
-        }
-        cancellation.enter()
-        writer.setCancelHandler { child.closeInput(); cancellation.leave() }
-        self.writer = writer
-        writer.resume()
-        let reader = DispatchSource.makeReadSource(fileDescriptor: child.output, queue: queue)
-        reader.setEventHandler { [weak self] in
-            guard let self, !self.closing else { return }
-            var buffer = [UInt8](repeating: 0, count: 65536)
-            let count = read(child.output, &buffer, buffer.count)
-            if count < 0 && (errno == EAGAIN || errno == EINTR) { return }
-            if count > 0 { self.consumeOutput(Data(buffer.prefix(count))); return }
-            if count < 0 { self.fail("Backend stream read failed."); return }
-            guard self.lineBuffer.isEmpty else { self.fail("Truncated backend stream output."); return }
-            if !self.receivedEnvelope { self.fail("Backend does not support event streaming.") }
-            else { self.finish(code: 1000, reason: "Backend stream ended") }
-        }
-        cancellation.enter()
-        reader.setCancelHandler { cancellation.leave() }
-        self.reader = reader
-        reader.resume()
-        queue.asyncAfter(deadline: .now() + 30) { [weak self] in
-            guard let self, !self.receivedEnvelope else { return }
-            self.fail("Backend did not start the event stream.")
-        }
+        epoch = UUID().uuidString
+        let pollTimer = DispatchSource.makeTimerSource(queue: queue)
+        pollTimer.schedule(deadline: .now(), repeating: 2)
+        pollTimer.setEventHandler { [weak self] in self?.poll() }
+        self.pollTimer = pollTimer
+        pollTimer.resume()
     }
 
-    private func consumeOutput(_ data: Data) {
-        lineBuffer.append(data)
-        while let newline = lineBuffer.firstIndex(of: 10) {
-            let line = Data(lineBuffer[..<newline])
-            lineBuffer.removeSubrange(...newline)
-            guard line.count <= 1_048_576 else { fail("Backend event exceeds the size limit."); return }
-            consumeLine(line)
-            if closing { return }
+    private var pollContext: BackendRequestContext?
+    private func poll() {
+        guard !closing, !pollInFlight else { return }
+        pollInFlight = true
+        let context = BackendRequestContext()
+        pollContext = context
+        let id = sessionID
+        DispatchQueue.global().async { [weak self] in
+            guard let self else { return }
+            let result: Result<[String: Any], Error> = Result {
+                let data = try self.backend.call(Data(#"{"operation":"list"}"#.utf8), context: context)
+                guard let reply = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let sessions = reply["sessions"] as? [[String: Any]],
+                      let status = sessions.first(where: { $0["id"] as? String == id }) else {
+                    throw BridgeError.invalid("Session is no longer available.")
+                }
+                return status
+            }
+            self.queue.async {
+                self.pollInFlight = false
+                self.pollContext = nil
+                guard !self.closing else { return }
+                switch result {
+                case .success(let status):
+                    let envelope: [String: Any] = ["version": 1, "type": "snapshot", "sessionID": id,
+                        "epoch": self.epoch, "sequence": self.sequence + 1, "status": status, "activity": []]
+                    do { self.consumeLine(try JSONSerialization.data(withJSONObject: envelope)) }
+                    catch { self.fail("Could not encode session status.") }
+                case .failure(let error): self.fail(error.localizedDescription)
+                }
+            }
         }
-        if lineBuffer.count > 1_048_576 { fail("Backend event exceeds the size limit.") }
     }
 
     private func consumeLine(_ line: Data) {
         guard !closing else { return }
         guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
-            preambleBytes += line.count + 1
-            if receivedEnvelope || preambleBytes > 65536 { fail("Invalid backend stream output.") }
+            fail("Invalid backend stream output.")
             return
         }
         guard let version = object["version"] as? NSNumber,
@@ -219,28 +195,22 @@ final class EventStream {
     private func finish(code: UInt16, reason: String) {
         guard !closing else { return }
         closing = true
-        stopProcess()
+        stopPolling()
         timer?.cancel(); timer = nil
         if let frame = try? WebSocketEncoder.close(code: code, reason: reason) { send(frame) }
         queue.asyncAfter(deadline: .now() + 2) { [weak self] in self?.stop() }
     }
 
-    private func stopProcess() {
-        guard let process else { return }
-        self.process = nil
-        reader?.cancel(); reader = nil
-        writer?.cancel(); writer = nil
-        // Close only after dispatch has stopped using the descriptors. All I/O
-        // is nonblocking and queue-confined, so cancellation needs no thread join.
-        pipeCancellation?.notify(queue: queue) { process.stop() }
-        pipeCancellation = nil
+    private func stopPolling() {
+        pollTimer?.cancel(); pollTimer = nil
+        pollContext?.cancel(); pollContext = nil
     }
 
     func stop() {
         guard !closed else { return }
         closed = true; closing = true
         timer?.cancel(); timer = nil
-        stopProcess()
+        stopPolling()
         connection.cancel()
         onClose()
     }

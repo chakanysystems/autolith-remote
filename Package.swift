@@ -25,9 +25,9 @@ let package = Package(
             "BridgeCore", "ClientCore", "CBridgePOSIX", crypto,
             .product(name: "NIOCore", package: "swift-nio"),
             .product(name: "NIOPosix", package: "swift-nio"),
-        ]),
+        ], resources: [.copy("Resources/Request.lisp")]),
         .testTarget(name: "BridgeCoreTests", dependencies: ["BridgeCore"]),
         .testTarget(name: "MessageServiceTests", dependencies: ["AutolithBridge", "ClientCore"]),
-        .testTarget(name: "EventStreamTests", dependencies: ["AutolithBridge"]),
+        .testTarget(name: "EventStreamTests", dependencies: ["AutolithBridge", crypto]),
     ]
 )

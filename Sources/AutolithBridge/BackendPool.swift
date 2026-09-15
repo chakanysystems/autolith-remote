@@ -1,143 +1,128 @@
 import Foundation
+import BridgeCore
 #if canImport(Darwin)
 import Darwin
 #else
 import Glibc
 #endif
-import CBridgePOSIX
-import CoreFoundation
-import BridgeCore
 
-/// Bounded serial streams. Never replay a request after an uncertain failure.
+/// Serial management requests, with no retry after uncertain delivery.
 final class BackendPool: @unchecked Sendable {
-    private let lock = NSLock()
-    private let slots = DispatchSemaphore(value: 4)
-    private var idle: [BackendWorker] = []
-    private let executable: String
-    init(executable: String) { self.executable = executable }
+    private let slot = DispatchSemaphore(value: 1)
+    private let socketPath: String
+    private let tokenPath: String
+    private let mappingFile: URL
+    private let template: String
+    private var connections: [String: ManagementRPC] = [:]
+    private var endpoints: [String: String]
+    private var gatewayID: String?
 
-    /// Use the admission deadline for queueing, startup, handshake and user I/O.
-    /// An expired queued request is never dispatched to the backend.
-    func call(_ request: Data, deadline: DispatchTime = .now() + 60) throws -> Data {
+    init(socketPath: String, tokenPath: String, mappingFile: URL) throws {
+        self.socketPath = socketPath; self.tokenPath = tokenPath; self.mappingFile = mappingFile
+        guard let resource = Bundle.module.url(forResource: "Request", withExtension: "lisp") else {
+            throw BridgeError.invalid("The companion's management request resource is missing.")
+        }
+        template = try String(contentsOf: resource, encoding: .utf8)
+        if FileManager.default.fileExists(atPath: mappingFile.path) {
+            let metadata = try FileManager.default.attributesOfItem(atPath: mappingFile.path)
+            guard metadata[.type] as? FileAttributeType == .typeRegular,
+                  (metadata[.ownerAccountID] as? NSNumber)?.uint32Value == getuid(),
+                  (metadata[.posixPermissions] as? NSNumber)?.intValue == 0o600,
+                  (metadata[.size] as? NSNumber)?.intValue ?? Int.max <= 1_048_576 else {
+                throw BridgeError.invalid("Management endpoint inventory must be a private, owned regular file.")
+            }
+            endpoints = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: mappingFile))
+        } else { endpoints = [:] }
+    }
+
+    func checkConnection(context: BackendRequestContext = BackendRequestContext()) throws {
+        try acquire(context); defer { slot.signal() }
+        gatewayID = try exchange(["operation": "identity"], path: socketPath, context: context)["id"] as? String
+        guard gatewayID != nil else { throw BridgeError.invalid("Management endpoint has no active Autolith session.") }
+    }
+
+    func call(_ request: Data, deadline: DispatchTime) throws -> Data {
         try call(request, context: BackendRequestContext(deadline: deadline))
     }
 
-    func call(_ request: Data, context: BackendRequestContext) throws -> Data {
-        while true {
-            try context.check()
-            if slots.wait(timeout: min(context.deadline, .now() + 0.05)) == .success { break }
-        }
-        defer { slots.signal() }
+    func call(_ request: Data, context: BackendRequestContext = BackendRequestContext()) throws -> Data {
         try context.check()
-        lock.lock()
-        let worker = idle.popLast() ?? BackendWorker(executable: executable)
-        lock.unlock()
-        defer { lock.lock(); idle.append(worker); lock.unlock() }
-        return try worker.call(request, context: context)
-    }
-}
-
-private final class BackendWorker {
-    private let executable: String
-    private var child: BackendChild?
-    private var buffered = Data()
-    init(executable: String) { self.executable = executable }
-    private func stop() { child?.stop(); child = nil; buffered.removeAll() }
-
-    func call(_ request: Data, context: BackendRequestContext) throws -> Data {
-        do {
-            guard request.count <= 262144, !request.contains(10), !request.contains(13),
-                  (try? JSONSerialization.jsonObject(with: request)) is [String: Any] else {
-                throw BridgeError.invalid("Invalid backend request.")
-            }
-            try context.check()
-            if child == nil {
-                child = try BackendChild(executable: executable)
-                let handshake = try exchange(Data(#"{"operation":"rpc-handshake"}"#.utf8), context: context, allowPreamble: true)
-                guard let value = try JSONSerialization.jsonObject(with: handshake) as? [String: Any],
-                      let version = value["rpcProtocol"] as? NSNumber,
-                      CFGetTypeID(version) != CFBooleanGetTypeID(), version == 1 else {
-                    throw BridgeError.invalid("Update the Mac backend: persistent mobile RPC is required.")
-                }
-            }
-            return try exchange(request, context: context, allowPreamble: false)
-        } catch { stop(); throw error }
-    }
-
-    /// RPC v1 has no echoed correlation ID. Reject all observable surplus output,
-    /// including partial lines, instead of assigning it to the next request. A
-    /// late unsolicited response racing a new write still needs backend IDs.
-    private func requireQuietOutput(_ output: Int32, context: BackendRequestContext) throws {
-        var descriptor = pollfd(fd: output, events: Int16(POLLIN), revents: 0)
-        var result: Int32
-        repeat {
-            try context.check()
-            result = poll(&descriptor, 1, 0)
-        } while result < 0 && errno == EINTR
-        guard buffered.isEmpty, result == 0 else {
-            throw BridgeError.invalid("Unsolicited backend output or disconnected protocol stream.")
+        guard request.count <= 262144,
+              var object = try JSONSerialization.jsonObject(with: request) as? [String: Any],
+              let operation = object["operation"] as? String,
+              ["list", "create", "resume", "transcript", "catalog", "tell", "pause", "kill", "delete"].contains(operation) else {
+            throw BridgeError.invalid("Unsupported management operation.")
         }
+        try acquire(context); defer { slot.signal() }
+        // Refresh after gateway restarts or conversation changes, before any mutation.
+        gatewayID = try exchange(["operation": "identity"], path: socketPath, context: context)["id"] as? String
+        object.removeValue(forKey: "managementSocket")
+        object.removeValue(forKey: "requireCurrent")
+        let id = object["id"] as? String
+        guard id == nil || id != gatewayID else { throw BridgeError.invalid("The companion's gateway session is reserved for management.") }
+        var path = socketPath
+        if ["catalog", "transcript"].contains(operation), let id, let endpoint = endpoints[id],
+           FileManager.default.fileExists(atPath: endpoint) {
+            path = endpoint
+            object["requireCurrent"] = true
+        }
+        var newSocket: String?
+        if operation == "create" || operation == "resume" {
+            // Adjacent to the private gateway socket, with a fixed-size generated name.
+            newSocket = URL(fileURLWithPath: socketPath).deletingLastPathComponent()
+                .appendingPathComponent(UUID().uuidString + ".sock").path
+            guard newSocket!.utf8.count < 104 else {
+                throw BridgeError.invalid("Use a shorter management socket directory before creating sessions.")
+            }
+            object["managementSocket"] = newSocket!
+        }
+        var response = try exchange(object, path: path, context: context)
+        if operation == "list", let sessions = response["sessions"] as? [[String: Any]] {
+            response["sessions"] = sessions.filter { $0["id"] as? String != gatewayID }
+        }
+        if let newSocket, let created = response["id"] as? String {
+            endpoints[created] = newSocket
+            do { try saveEndpoints() }
+            catch { throw BridgeError.invalid("The session was created as \(created), but its management endpoint could not be saved. Refresh before retrying.") }
+        }
+        if operation == "delete", let id {
+            if let endpoint = endpoints.removeValue(forKey: id) { connections.removeValue(forKey: endpoint) }
+            try saveEndpoints()
+        }
+        return try JSONSerialization.data(withJSONObject: response)
     }
 
-    private func wait(_ fd: Int32, event: Int16, context: BackendRequestContext) throws {
+    private func acquire(_ context: BackendRequestContext) throws {
         while true {
             try context.check()
-            let remaining = context.remaining
-            var descriptor = pollfd(fd: fd, events: event, revents: 0)
-            let result = poll(&descriptor, 1, Int32(max(1, min(remaining * 1000, 50))))
-            if result < 0 && errno == EINTR { continue }
-            guard result >= 0 else { throw BridgeError.invalid("Backend pipe failed.") }
-            if result > 0 { try context.check(); return }
+            if slot.wait(timeout: min(context.deadline, .now() + 0.05)) == .success {
+                do { try context.check(); return }
+                catch { slot.signal(); throw error }
+            }
         }
     }
+    private func saveEndpoints() throws {
+        try FileManager.default.createDirectory(at: mappingFile.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try JSONEncoder().encode(endpoints).write(to: mappingFile, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: mappingFile.path)
+    }
 
-    private func exchange(_ request: Data, context: BackendRequestContext, allowPreamble: Bool) throws -> Data {
-        guard let child else { throw BridgeError.invalid("Backend unavailable.") }
-        if !allowPreamble { try requireQuietOutput(child.output, context: context) }
-        let payload = request + Data([10])
-        try payload.withUnsafeBytes { bytes in
-            var offset = 0
-            while offset < bytes.count {
-                try wait(child.input, event: Int16(POLLOUT), context: context)
-                let written = try context.whileActive {
-                    bridge_write(child.input, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
-                }
-                if written < 0 && (errno == EINTR || errno == EAGAIN) { continue }
-                guard written > 0 else { throw BridgeError.invalid("Backend disconnected. Check the conversation before retrying a mutation.") }
-                offset += written
-            }
+    private func exchange(_ request: [String: Any], path: String, context: BackendRequestContext) throws -> [String: Any] {
+        let json = String(decoding: try JSONSerialization.data(withJSONObject: request), as: UTF8.self)
+        let source = template.replacingOccurrences(of: "__REQUEST_JSON__", with: ManagementForm.quote(json))
+        let connection: ManagementRPC
+        if let existing = connections[path] { connection = existing }
+        else {
+            if connections.count >= 4 { connections.removeAll() }
+            connection = ManagementRPC(socketPath: path, tokenPath: tokenPath)
+            connections[path] = connection
         }
-        var preamble = 0
-        while true {
-            try context.check()
-            if let newline = buffered.firstIndex(of: 10) {
-                let line = Data(buffered[..<newline]); buffered.removeSubrange(...newline)
-                guard line.count <= 8_000_000 else { throw BridgeError.invalid("Backend response exceeds the size limit.") }
-                if (try? JSONSerialization.jsonObject(with: line)) is [String: Any] {
-                    // A hangup after a complete reply is valid, but extra bytes are not.
-                    var byte: UInt8 = 0
-                    var extra: Int
-                    repeat {
-                        try context.check()
-                        extra = read(child.output, &byte, 1)
-                    } while extra < 0 && errno == EINTR
-                    guard buffered.isEmpty, extra == 0 || (extra < 0 && errno == EAGAIN) else {
-                        throw BridgeError.invalid("Unsolicited backend output.")
-                    }
-                    try context.check()
-                    return line
-                }
-                preamble += line.count + 1
-                guard allowPreamble, preamble <= 65536 else { throw BridgeError.invalid("Invalid backend response.") }
-                continue
-            }
-            guard buffered.count <= 8_000_000 else { throw BridgeError.invalid("Backend response exceeds the size limit.") }
-            try wait(child.output, event: Int16(POLLIN), context: context)
-            var bytes = [UInt8](repeating: 0, count: 65536)
-            let length = read(child.output, &bytes, bytes.count)
-            if length < 0 && (errno == EINTR || errno == EAGAIN) { continue }
-            guard length > 0 else { throw BridgeError.invalid("Backend disconnected. Check the conversation before retrying a mutation.") }
-            buffered.append(contentsOf: bytes.prefix(length))
+        let values = try connection.evaluate(source, context: context)
+        guard values.count == 1,
+              let json = try ManagementForm.parse(Data(values[0].utf8)).string,
+              let response = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any] else {
+            throw BridgeError.invalid("Management RPC did not return a JSON object.")
         }
+        return response
     }
 }

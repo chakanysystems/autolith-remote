@@ -48,18 +48,23 @@ final class BackendPOSIXTests: XCTestCase {
         #endif
         let script = """
         #!\(try fixtureShellPath())
-        read -r handshake
-        printf '%s\\n' '{"rpcProtocol":1}'
-        read -r request
         if test -e \(descriptorPath); then
             printf '%s\\n' '{"inherited":true}'
         else
             printf '%s\\n' '{"inherited":false}'
-        fi
+        fi > "$0.result"
         """
         try script.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
-        let reply = try BackendPool(executable: executable.path).call(Data(#"{"operation":"list"}"#.utf8))
+        let child = try BackendChild(executable: executable.path)
+        defer { child.stop() }
+        let resultFile = URL(fileURLWithPath: executable.path + ".result")
+        let deadline = Date().addingTimeInterval(3)
+        var reply = Data()
+        repeat {
+            reply = (try? Data(contentsOf: resultFile)) ?? Data()
+            if !reply.contains(10) { Thread.sleep(forTimeInterval: 0.01) }
+        } while !reply.contains(10) && Date() < deadline
         let result = try XCTUnwrap(JSONSerialization.jsonObject(with: reply) as? [String: Bool])
         XCTAssertEqual(result["inherited"], false)
     }

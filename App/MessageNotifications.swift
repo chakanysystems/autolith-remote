@@ -64,7 +64,7 @@ import UIKit
     }
 
     /// Call before replacing saved credentials. Use a snapshot so another save
-    /// cannot redirect this request to the new Mac while it is suspended.
+    /// cannot redirect this request to the new computer while it is suspended.
     func revoke(connection: Connection) async {
         activeConnection = connection
         let captured = connection.context
@@ -77,7 +77,7 @@ import UIKit
             let reply = try await connection.call(["operation": "notification-unregister", "pushToken": token, "host": captured.host], context: captured)
             try SiriMessageReceipt.confirmed(reply.ok)
         } catch {
-            UserDefaults.standard.set("Could not revoke alerts on the previous Mac. Its registration may continue until the seven-day lease expires: " + error.localizedDescription, forKey: "messageNotificationError")
+            UserDefaults.standard.set("Could not revoke alerts on the previous computer. Its registration may continue until the seven-day lease expires: " + error.localizedDescription, forKey: "messageNotificationError")
         }
     }
 
@@ -111,7 +111,7 @@ import UIKit
         var attempted = false
         defer {
             if registration.finishRemoteRegistration(request, accepted: accepted, now: Date()) {
-                UserDefaults.standard.set("Remote notifications registered with the Mac.", forKey: "messageNotificationStatus")
+                UserDefaults.standard.set("Remote notifications registered with the computer.", forKey: "messageNotificationStatus")
             }
         }
         do {
@@ -131,7 +131,7 @@ import UIKit
         } catch {
             if attempted && (!valid(connection, captured) || !registration.isCurrent(request)) {
                 // An unconfirmed response can still mean the server committed it.
-                // Best-effort cleanup uses the original credentials, never the new Mac.
+                // Best-effort cleanup uses the original credentials, never the new computer.
                 do {
                     let revoked = try await connection.call(["operation": "notification-unregister", "pushToken": request.token, "host": host], context: captured)
                     try SiriMessageReceipt.confirmed(revoked.ok)
@@ -250,7 +250,7 @@ import UIKit
         let connection = activeConnection ?? Connection()
         let captured = connection.context
         guard !connection.switching, CompanionEndpoint.equivalent(captured.host, host) else {
-            UserDefaults.standard.set("This notification belongs to a different Mac.", forKey: "messageNotificationError")
+            UserDefaults.standard.set("This notification belongs to a different computer.", forKey: "messageNotificationError")
             return
         }
         if let reply = response as? UNTextInputNotificationResponse {

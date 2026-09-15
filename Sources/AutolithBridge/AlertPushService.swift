@@ -89,7 +89,7 @@ final class AlertPushService: @unchecked Sendable {
     }
 
     func register(_ object: [String: Any], beforeMutation: () throws -> Void = {}) throws {
-        guard enabled() else { throw BridgeError.invalid("APNs is not configured on this Mac.") }
+        guard enabled() else { throw BridgeError.invalid("APNs is not configured on this computer.") }
         let (token, host) = try identity(object)
         try queue.sync {
             try beforeMutation()

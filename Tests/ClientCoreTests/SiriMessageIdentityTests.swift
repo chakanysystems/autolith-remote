@@ -3,7 +3,7 @@ import XCTest
 
 final class SiriMessageIdentityTests: XCTestCase {
     func testMessageIdentityIncludesHostSessionAndDurableEvent() {
-        let identity = SiriMessageIdentity(host: "https://mac.example", sessionID: "session/#λ", eventID: "84")
+        let identity = SiriMessageIdentity(host: "https://computer.example", sessionID: "session/#λ", eventID: "84")
         XCTAssertEqual(SiriMessageIdentity(id: identity.id), identity)
         XCTAssertNotEqual(identity.id, SiriMessageIdentity(host: "https://other.example", sessionID: identity.sessionID, eventID: "84").id)
         XCTAssertNotEqual(identity.id, SiriMessageIdentity(host: identity.host, sessionID: "other", eventID: "84").id)

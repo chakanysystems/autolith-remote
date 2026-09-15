@@ -142,7 +142,7 @@ struct Reply: Codable, Sendable {
         let candidate = ConnectionContext(host: try CompanionEndpoint.canonical(host), token: token, generation: generation)
         try await ConnectionCandidateProbe.validate(previous: previous, candidate: candidate, current: { self.context }) { candidate in
             let reply = try await self.call(["operation": "list"], context: candidate)
-            guard reply.sessions != nil else { throw self.failure("The Mac did not return a session list.") }
+            guard reply.sessions != nil else { throw self.failure("The computer did not return a session list.") }
         }
         guard previous.host != candidate.host || previous.token != candidate.token else { return }
         // Invalidate in-flight UI work before waiting for old-identity revocation.
@@ -186,7 +186,7 @@ struct Reply: Codable, Sendable {
     func failure(_ message: String) -> NSError { NSError(domain: "Autolith", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
     func endpoint() throws -> URL {
         let address = try CompanionEndpoint.canonical(host)
-        guard let url = URL(string: address) else { throw failure("Enter the Mac's HTTPS address.") }
+        guard let url = URL(string: address) else { throw failure("Enter the computer's HTTPS address.") }
         guard !token.isEmpty else { throw failure("Enter your companion token.") }
         return url.appendingPathComponent("rpc")
     }
@@ -199,7 +199,7 @@ struct Reply: Codable, Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
         let (data, response) = try await BoundedHTTP.data(for: request, limit: BoundedHTTP.limit(operation: payload["operation"] as? String ?? ""))
-        guard response.statusCode == 200 else { throw failure("The Mac companion rejected the request (\(response.statusCode)).") }
+        guard response.statusCode == 200 else { throw failure("The computer companion rejected the request (\(response.statusCode)).") }
         let reply = try await BackgroundWork.run { try JSONDecoder().decode(Reply.self, from: data) }
         if let message = reply.error { throw failure(message) }
         return reply
@@ -270,7 +270,7 @@ struct Reply: Codable, Sendable {
                 if !snapshot.revision.isEmpty { request["revision"] = snapshot.revision }
                 var reply = try await self.call(request)
                 guard !Task.isCancelled, self.generation == generation, self.sessionEpochs[id] == epoch else { return }
-                guard reply.revision != nil else { throw self.failure("Update the Mac companion to enable transcript synchronization.") }
+                guard reply.revision != nil else { throw self.failure("Update the computer companion to enable transcript synchronization.") }
                 var prepared: (snapshot: CachedTranscript, changed: Bool)
                 do {
                     prepared = try await Self.prepareTranscript(snapshot, reply: reply)
@@ -520,7 +520,7 @@ struct Reply: Codable, Sendable {
             catalogSession = session.id
         } catch {
             guard catalogRequest == request, selection == session.id, !(error is CancellationError) else { return }
-            catalogError = "Could not load this session’s models and completions. Older sessions need to be stopped and resumed after updating the Mac backend. \(error.localizedDescription)"
+            catalogError = "Could not load this session’s models and completions. Older sessions need to be stopped and resumed after updating the computer backend. \(error.localizedDescription)"
         }
     }
     func selectModel(_ model: ModelOption, session: Session) async -> Bool {

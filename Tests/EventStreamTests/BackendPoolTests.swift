@@ -1,170 +1,45 @@
 import XCTest
-#if canImport(Darwin)
-import Darwin
-#else
-import Glibc
-#endif
+import Foundation
 @testable import AutolithBridge
 
 final class BackendPoolTests: XCTestCase {
-    private func fixture(_ script: String) throws -> URL {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let executable = directory.appendingPathComponent("backend")
-        try ("#!\(try fixtureShellPath())\n" + script).write(to: executable, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
-        return executable
-    }
-
-    func testReusesProcessForConsecutiveRequests() throws {
-        let executable = try fixture("read -r handshake\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nwhile read -r request; do printf '{\"pid\":%s}\\n' \"$$\"; done\n")
-        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
-        let pool = BackendPool(executable: executable.path)
-        let request = Data(#"{"operation":"list"}"#.utf8)
-        let first = try pool.call(request)
-        for _ in 0..<5 { XCTAssertEqual(try pool.call(request), first) }
-    }
-
-    func testNeverRetriesMutationAfterUncertainDisconnect() throws {
-        let executable = try fixture("read -r handshake\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\nprintf '%s\\n' \"$request\" >> \"$0.received\"\nexit 0\n")
-        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
-        let pool = BackendPool(executable: executable.path)
-        XCTAssertThrowsError(try pool.call(Data(#"{"operation":"tell"}"#.utf8)))
-        let requests = try String(contentsOfFile: executable.path + ".received").split(separator: "\n")
-        XCTAssertEqual(requests.count, 1)
-    }
-
-    func testRejectsOldBackendBeforeSendingUserCommand() throws {
-        let executable = try fixture("read -r handshake\nprintf '%s\\n' \"$handshake\" > \"$0.received\"\nprintf '%s\\n' '{\"error\":\"Unsupported operation\"}'\n")
-        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
-        let pool = BackendPool(executable: executable.path)
-        XCTAssertThrowsError(try pool.call(Data(#"{"operation":"tell"}"#.utf8)))
-        XCTAssertEqual(try String(contentsOfFile: executable.path + ".received").trimmingCharacters(in: .whitespacesAndNewlines), #"{"operation":"rpc-handshake"}"#)
-    }
-
-    func testDisposingPoolTerminatesLauncherChildren() throws {
-        let executable = try fixture("read -r handshake\nprintf '%s\\n' '{\"rpcProtocol\":1}'\n\(fixtureSleepPath()) 30 &\nchild=$!\nwhile read -r request; do printf '{\"child\":%s}\\n' \"$child\"; done\nwait\n")
-        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
-        var pool: BackendPool? = BackendPool(executable: executable.path)
-        let result = try JSONSerialization.jsonObject(with: pool!.call(Data(#"{"operation":"list"}"#.utf8))) as! [String: Int32]
-        let child = try XCTUnwrap(result["child"])
-        XCTAssertEqual(kill(child, 0), 0)
-        pool = nil
-        try assertProcessTerminates(child, timeout: 5)
-    }
-
-    func testStopAllowsTermHandlerBeforeForcedCleanup() throws {
-        let executable = try fixture("trap 'printf stopped > \"$0.stopped\"; exit 0' TERM\nread -r handshake\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\nprintf '%s\\n' '{\"ok\":true}'\nwhile :; do :; done\n")
-        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
-        var pool: BackendPool? = BackendPool(executable: executable.path)
-        _ = try pool!.call(Data(#"{"operation":"list"}"#.utf8))
-        pool = nil
-        let limit = Date().addingTimeInterval(2)
-        while !FileManager.default.fileExists(atPath: executable.path + ".stopped") && Date() < limit {
-            Thread.sleep(forTimeInterval: 0.01)
+    func testRoutesJSONWithoutReaderInjectionAndReusesConnection() throws {
+        let server = try ManagementTestServer()
+        defer { server.stop() }
+        let complete = expectation(description: "requests")
+        let message = "\") (error \"injected\") ;\nλ\\"
+        server.serve { socket in
+            defer { complete.fulfill() }
+            try server.authenticate(socket)
+            XCTAssertEqual(try ManagementTestServer.request(server.receive(socket))["operation"] as? String, "identity")
+            try server.reply(socket, ["id": "gateway"])
+            let request = try ManagementTestServer.request(server.receive(socket))
+            XCTAssertEqual(request["operation"] as? String, "tell")
+            XCTAssertEqual(request["message"] as? String, message)
+            XCTAssertNil(request["managementSocket"])
+            XCTAssertNil(request["requireCurrent"])
+            try server.reply(socket, ["ok": true])
+            XCTAssertEqual(try ManagementTestServer.request(server.receive(socket))["operation"] as? String, "identity")
+            try server.reply(socket, ["id": "gateway"])
+            XCTAssertEqual(try ManagementTestServer.request(server.receive(socket))["operation"] as? String, "list")
+            try server.reply(socket, ["sessions": [["id": "gateway"], ["id": "s"]]])
         }
-        XCTAssertTrue(FileManager.default.fileExists(atPath: executable.path + ".stopped"))
-    }
-    func testHandshakeAndRequestShareDeadline() throws {
-        // Each phase fits a fresh one-second budget, but their sum does not.
-        // Leave room for process startup so the test reaches the request phase.
-        let executable = try fixture("read -r handshake\n\(fixtureSleepPath()) 0.4\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\nprintf '%s\\n' \"$request\" > \"$0.received\"\n\(fixtureSleepPath()) 0.8\nprintf '%s\\n' '{\"ok\":true}'\n")
-        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
-        let pool = BackendPool(executable: executable.path)
-        let start = ProcessInfo.processInfo.systemUptime
-        XCTAssertThrowsError(try pool.call(Data(#"{"operation":"tell"}"#.utf8), deadline: .now() + 1))
-        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 1.2)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: executable.path + ".received"))
+        let pool = try BackendPool(socketPath: server.path, tokenPath: server.tokenPath,
+                                   mappingFile: server.directory.appendingPathComponent("map.json"))
+        _ = try pool.call(JSONSerialization.data(withJSONObject: ["operation": "tell", "id": "s", "message": message,
+            "managementSocket": "/untrusted", "requireCurrent": true]))
+        let reply = try JSONSerialization.jsonObject(with: pool.call(Data(#"{"operation":"list"}"#.utf8))) as? [String: Any]
+        XCTAssertEqual((reply?["sessions"] as? [[String: String]])?.map { $0["id"] }, ["s"])
+        wait(for: [complete], timeout: 5)
     }
 
-    func testCancelledHandshakeNeverDispatchesMutation() throws {
-        let executable = try fixture("read -r handshake\nprintf 'started' > \"$0.started\"\n\(fixtureSleepPath()) 1\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\nprintf '%s\\n' \"$request\" > \"$0.received\"\n")
-        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
-        let pool = BackendPool(executable: executable.path)
-        let context = BackendRequestContext(deadline: .now() + 5)
-        let finished = expectation(description: "cancelled")
-        DispatchQueue.global().async {
-            do {
-                _ = try pool.call(Data(#"{"operation":"tell"}"#.utf8), context: context)
-                XCTFail("Cancelled handshake unexpectedly dispatched a request")
-            } catch {}
-            finished.fulfill()
+    func testRejectsArbitraryOperationsBeforeConnecting() throws {
+        let server = try ManagementTestServer()
+        defer { server.stop() }
+        let pool = try BackendPool(socketPath: server.path, tokenPath: server.tokenPath,
+                                   mappingFile: server.directory.appendingPathComponent("map.json"))
+        for operation in ["evaluate", "identity", "stop-idle", "rpc-handshake"] {
+            XCTAssertThrowsError(try pool.call(JSONSerialization.data(withJSONObject: ["operation": operation])))
         }
-        let limit = Date().addingTimeInterval(2)
-        while !FileManager.default.fileExists(atPath: executable.path + ".started") && Date() < limit { Thread.sleep(forTimeInterval: 0.01) }
-        XCTAssertTrue(FileManager.default.fileExists(atPath: executable.path + ".started"))
-        context.cancel()
-        wait(for: [finished], timeout: 0.5)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: executable.path + ".received"))
-    }
-
-    func testExpiredPoolWaiterIsNeverDispatched() throws {
-        let executable = try fixture("read -r handshake\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\nprintf '%s\\n' \"$request\" >> \"$0.received\"\n\(fixtureSleepPath()) 2\nprintf '%s\\n' '{\"ok\":true}'\n")
-        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
-        let pool = BackendPool(executable: executable.path)
-        let contexts = (0..<4).map { _ in BackendRequestContext(deadline: .now() + 5) }
-        let finished = expectation(description: "workers stopped"); finished.expectedFulfillmentCount = 4
-        for context in contexts {
-            DispatchQueue.global().async {
-                _ = try? pool.call(Data(#"{"operation":"list"}"#.utf8), context: context)
-                finished.fulfill()
-            }
-        }
-        let limit = Date().addingTimeInterval(2)
-        var observed = 0
-        repeat {
-            observed = (try? String(contentsOfFile: executable.path + ".received").split(separator: "\n").count) ?? 0
-            if observed < 4 { Thread.sleep(forTimeInterval: 0.01) }
-        } while observed < 4 && Date() < limit
-        XCTAssertEqual(observed, 4)
-        XCTAssertThrowsError(try pool.call(Data(#"{"operation":"tell"}"#.utf8), deadline: .now() + 0.1))
-        let queued = BackendRequestContext(deadline: .now() + 5)
-        let started = expectation(description: "cancellation thread started")
-        let cancelled = expectation(description: "queued cancellation")
-        // Four blocking calls can occupy all global dispatch workers on CI.
-        // Measure cancellation after this thread starts, not dispatch queue delay.
-        Thread.detachNewThread {
-            started.fulfill()
-            do {
-                _ = try pool.call(Data(#"{"operation":"tell"}"#.utf8), context: queued)
-                XCTFail("Cancelled pool waiter unexpectedly dispatched a request")
-            } catch {}
-            cancelled.fulfill()
-        }
-        wait(for: [started], timeout: 2)
-        queued.cancel()
-        wait(for: [cancelled], timeout: 0.5)
-        contexts.forEach { $0.cancel() }
-        wait(for: [finished], timeout: 1)
-        XCTAssertFalse(try String(contentsOfFile: executable.path + ".received").contains("tell"))
-    }
-
-    func testRejectsExtraReplyAndPartialSurplus() throws {
-        for extra in ["{\"stale\":true}\\n", "partial"] {
-            let executable = try fixture("read -r handshake\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\nprintf '{\"ok\":true}\\n" + extra + "'\n\(fixtureSleepPath()) 2\n")
-            defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
-            XCTAssertThrowsError(try BackendPool(executable: executable.path).call(Data(#"{"operation":"list"}"#.utf8)))
-        }
-    }
-
-    func testRejectsLateIdleOutputBeforeNextDispatch() throws {
-        let executable = try fixture("read -r handshake\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\nprintf '%s\\n' '{\"ok\":true}'\n\(fixtureSleepPath()) 0.1\nprintf '%s\\n' '{\"stale\":true}'\nprintf ready > \"$0.ready\"\nread -r request\nprintf '%s\\n' \"$request\" > \"$0.received\"\n")
-        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
-        let pool = BackendPool(executable: executable.path)
-        _ = try pool.call(Data(#"{"operation":"list"}"#.utf8))
-        let limit = Date().addingTimeInterval(2)
-        while !FileManager.default.fileExists(atPath: executable.path + ".ready") && Date() < limit { Thread.sleep(forTimeInterval: 0.01) }
-        XCTAssertTrue(FileManager.default.fileExists(atPath: executable.path + ".ready"))
-        XCTAssertThrowsError(try pool.call(Data(#"{"operation":"tell"}"#.utf8)))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: executable.path + ".received"))
-    }
-
-    func testExitedLauncherDescendantsAreKilledOnTimeout() throws {
-        let executable = try fixture("read -r handshake\nprintf '%s\\n' '{\"rpcProtocol\":1}'\nread -r request\n\(fixtureSleepPath()) 30 &\nprintf '%s' \"$!\" > \"$0.child\"\nexit 0\n")
-        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
-        let pool = BackendPool(executable: executable.path)
-        XCTAssertThrowsError(try pool.call(Data(#"{"operation":"list"}"#.utf8), deadline: .now() + 0.3))
-        let pid = try XCTUnwrap(Int32(String(contentsOfFile: executable.path + ".child")))
-        try assertProcessTerminates(pid, timeout: 2)
     }
 }

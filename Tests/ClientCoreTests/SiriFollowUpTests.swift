@@ -44,22 +44,22 @@ import XCTest
         let name = UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
-        SiriConversationMemory.remember(id: "original", host: "mac-a", defaults: defaults)
-        XCTAssertEqual(SiriConversationMemory.identifier(host: "mac-a", defaults: defaults), "original")
-        XCTAssertNil(SiriConversationMemory.identifier(host: "mac-b", defaults: defaults))
-        SiriConversationMemory.remember(id: "read-session", host: "mac-a", defaults: defaults)
-        XCTAssertEqual(SiriConversationMemory.identifier(host: "mac-a", defaults: defaults), "read-session")
+        SiriConversationMemory.remember(id: "original", host: "computer-a", defaults: defaults)
+        XCTAssertEqual(SiriConversationMemory.identifier(host: "computer-a", defaults: defaults), "original")
+        XCTAssertNil(SiriConversationMemory.identifier(host: "computer-b", defaults: defaults))
+        SiriConversationMemory.remember(id: "read-session", host: "computer-a", defaults: defaults)
+        XCTAssertEqual(SiriConversationMemory.identifier(host: "computer-a", defaults: defaults), "read-session")
     }
     func testReadingAnOlderConversationDoesNotMoveLastSentConversation() throws {
         let name = UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
-        SiriConversationMemory.sent(id: "new", host: "mac-a", defaults: defaults)
-        SiriConversationMemory.remember(id: "old", host: "mac-a", defaults: defaults)
-        XCTAssertEqual(SiriConversationMemory.lastSentIdentifier(host: "mac-a", defaults: defaults), "new")
-        XCTAssertEqual(SiriConversationMemory.identifier(host: "mac-a", defaults: defaults), "old")
-        XCTAssertNil(SiriConversationMemory.lastSentIdentifier(host: "mac-b", defaults: defaults))
-        SiriConversationMemory.sent(id: "other", host: "mac-b", defaults: defaults)
-        XCTAssertEqual(SiriConversationMemory.lastSentIdentifier(host: "mac-a", defaults: defaults), "new")
+        SiriConversationMemory.sent(id: "new", host: "computer-a", defaults: defaults)
+        SiriConversationMemory.remember(id: "old", host: "computer-a", defaults: defaults)
+        XCTAssertEqual(SiriConversationMemory.lastSentIdentifier(host: "computer-a", defaults: defaults), "new")
+        XCTAssertEqual(SiriConversationMemory.identifier(host: "computer-a", defaults: defaults), "old")
+        XCTAssertNil(SiriConversationMemory.lastSentIdentifier(host: "computer-b", defaults: defaults))
+        SiriConversationMemory.sent(id: "other", host: "computer-b", defaults: defaults)
+        XCTAssertEqual(SiriConversationMemory.lastSentIdentifier(host: "computer-a", defaults: defaults), "new")
     }
 }

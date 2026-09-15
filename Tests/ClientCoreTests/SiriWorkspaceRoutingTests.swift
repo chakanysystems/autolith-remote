@@ -26,13 +26,13 @@ final class SiriWorkspaceRoutingTests: XCTestCase {
         let config = SiriWorkspaceConfiguration(nicknames: [paths[0]: "backend", paths[1]: "backend"])
         XCTAssertEqual(SiriWorkspaceRouting.candidates(request: "In backend, investigate", paths: paths, configuration: config), Array(paths.prefix(2)))
     }
-    func testPreferencesAreScopedToMacAndPersist() throws {
+    func testPreferencesAreScopedToComputerAndPersist() throws {
         let name = UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let config = SiriWorkspaceConfiguration(defaultPath: paths[0], nicknames: [paths[0]: "backend"])
-        try config.save(host: "https://mac-a", defaults: defaults)
-        XCTAssertEqual(SiriWorkspaceConfiguration.load(host: "https://mac-a", defaults: defaults), config)
-        XCTAssertNil(SiriWorkspaceConfiguration.load(host: "https://mac-b", defaults: defaults).defaultPath)
+        try config.save(host: "https://computer-a", defaults: defaults)
+        XCTAssertEqual(SiriWorkspaceConfiguration.load(host: "https://computer-a", defaults: defaults), config)
+        XCTAssertNil(SiriWorkspaceConfiguration.load(host: "https://computer-b", defaults: defaults).defaultPath)
     }
 }

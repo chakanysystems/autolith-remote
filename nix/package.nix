@@ -80,16 +80,34 @@ stdenv.mkDerivation {
   doInstallCheck = true;
   installCheckPhase = ''
     runHook preInstallCheck
-    status=0
-    env -u LD_LIBRARY_PATH -u AUTOLITH_BRIDGE_TOKEN_FILE "$out/bin/autolith-bridge" >startup.log 2>&1 || status=$?
-    cat startup.log
-    test "$status" -eq 64
+    state=$(mktemp -d)
+    # Stop at management configuration, after automatic bearer-token provisioning.
+    for attempt in 1 2; do
+      status=0
+      env -u LD_LIBRARY_PATH -u AUTOLITH_BRIDGE_TOKEN_FILE -u AUTOLITH_MANAGEMENT_REPL_TOKEN_FILE \
+        XDG_STATE_HOME="$state" AUTOLITH_MANAGEMENT_REPL_UNIX_SOCKET=/unused \
+        "$out/bin/autolith-bridge" >startup.log 2>&1 || status=$?
+      test "$status" -eq 69
+      test "$(wc -c < "$state/autolith-bridge/token")" -eq 64
+      test "$(stat -c %a "$state/autolith-bridge/token")" = 600
+      test "$(stat -c %a "$state/autolith-bridge")" = 700
+      ! grep -Fq -f "$state/autolith-bridge/token" startup.log
+      grep -Fq "Bridge token file: $state/autolith-bridge/token" startup.log
+      cat startup.log
+      if test "$attempt" -eq 1; then
+        cp "$state/autolith-bridge/token" "$state/first-token"
+      else
+        cmp "$state/first-token" "$state/autolith-bridge/token"
+      fi
+    done
+    rm -rf "$state"
     runHook postInstallCheck
   '';
 
   installPhase = ''
     runHook preInstall
     install -Dm755 "$(swiftpmBinPath)/autolith-bridge" "$out/bin/autolith-bridge"
+    cp -R "$(swiftpmBinPath)/AutolithCompanion_AutolithBridge.${if stdenv.hostPlatform.isDarwin then "bundle" else "resources"}" "$out/bin/"
     install -Dm644 LICENSE "$out/share/licenses/autolith-bridge/LICENSE"
     runHook postInstall
   '';

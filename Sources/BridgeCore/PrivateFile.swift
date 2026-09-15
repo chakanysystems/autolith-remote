@@ -34,9 +34,64 @@ public enum PrivateFile {
         }
     }
 
+    /// Creates missing directories without changing existing permissions or following a final symlink.
+    public static func createDirectory(at url: URL) throws {
+        guard url.isFileURL, url.path != "/" else { throw BridgeError.invalid("Invalid private directory path.") }
+        let parentURL = url.deletingLastPathComponent()
+        var attributes = stat()
+        if lstat(parentURL.path, &attributes) != 0 {
+            guard errno == ENOENT else { throw BridgeError.invalid("Cannot inspect credential directory.") }
+            try createDirectory(at: parentURL)
+        }
+        let parent = try openDirectory(parentURL, requirePrivate: false)
+        defer { close(parent) }
+        guard mkdirat(parent, url.lastPathComponent, 0o700) == 0 || errno == EEXIST else {
+            throw BridgeError.invalid("Cannot create private credential directory.")
+        }
+        let descriptor = openat(parent, url.lastPathComponent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else { throw BridgeError.invalid("Invalid private credential directory.") }
+        defer { close(descriptor) }
+        guard fstat(descriptor, &attributes) == 0, attributes.st_uid == getuid(),
+              attributes.st_mode & 0o7777 == 0o700 else {
+            throw BridgeError.invalid("Store credentials in an owned directory with mode 0700.")
+        }
+        try rejectAccessGrants(descriptor)
+        guard fsync(parent) == 0 else { throw BridgeError.invalid("Cannot save private credential directory.") }
+    }
+
+    /// Publishes a complete random token atomically, never replacing an existing token.
+    /// Swift's system generator uses the operating system cryptographic random source.
+    public static func createRandomToken(directory: Int32, hexadecimal: Bool = false) throws {
+        var attributes = stat()
+        if fstatat(directory, "token", &attributes, AT_SYMLINK_NOFOLLOW) == 0 { return }
+        guard errno == ENOENT else { throw BridgeError.invalid("Cannot inspect private token.") }
+        var random = SystemRandomNumberGenerator()
+        let randomBytes = (0..<32).map { _ in UInt8.random(in: .min ... .max, using: &random) }
+        let bytes = hexadecimal ? Array(randomBytes.map { String(format: "%02x", $0) }.joined().utf8) : randomBytes
+        let temporary = ".token-" + UUID().uuidString
+        let descriptor = openat(directory, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { throw BridgeError.invalid("Cannot create private token.") }
+        defer { close(descriptor); unlinkat(directory, temporary, 0) }
+        guard fchmod(descriptor, 0o600) == 0 else { throw BridgeError.invalid("Cannot secure private token.") }
+        try rejectAccessGrants(descriptor)
+        try bytes.withUnsafeBytes { buffer in
+            var offset = 0
+            while offset < buffer.count {
+                let count = write(descriptor, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
+                if count < 0 && errno == EINTR { continue }
+                guard count > 0 else { throw BridgeError.invalid("Cannot write private token.") }
+                offset += count
+            }
+        }
+        guard fsync(descriptor) == 0 else { throw BridgeError.invalid("Cannot save private token.") }
+        guard linkat(directory, temporary, directory, "token", 0) == 0 || errno == EEXIST else {
+            throw BridgeError.invalid("Cannot publish private token.")
+        }
+        guard fsync(directory) == 0 else { throw BridgeError.invalid("Cannot save private token directory.") }
+    }
     /// The caller owns the returned directory descriptor. System path aliases are
     /// resolved before a descriptor-relative walk that rejects writable ancestors.
-    public static func openDirectory(_ url: URL) throws -> Int32 {
+    public static func openDirectory(_ url: URL, requirePrivate: Bool = true) throws -> Int32 {
         guard url.isFileURL else { throw BridgeError.invalid("Expected a private directory.") }
         // Foundation preserves some Darwin aliases (notably /var) even after
         // resolvingSymlinksInPath. Use libc's physical path before the no-follow walk.
@@ -68,7 +123,7 @@ public enum PrivateFile {
             }
             var attributes = stat()
             guard fstat(descriptor, &attributes) == 0,
-                  attributes.st_uid == getuid(), attributes.st_mode & 0o7777 == 0o700 else {
+                  !requirePrivate || (attributes.st_uid == getuid() && attributes.st_mode & 0o7777 == 0o700) else {
                 throw BridgeError.invalid("Store credentials in an owned directory with mode 0700.")
             }
             return descriptor

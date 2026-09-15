@@ -6,7 +6,7 @@ enum CompanionEndpoint {
         case invalidEndpoint
 
         var errorDescription: String? {
-            "Enter an HTTPS Mac address with a host and optional port, without a path, credentials, query, or fragment."
+            "Enter an HTTPS computer address with a host and optional port, without a path, credentials, query, or fragment."
         }
     }
 

@@ -7,7 +7,7 @@ final class AlertPushServiceTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         var file: URL { directory.appendingPathComponent("devices.json") }
         let token = String(repeating: "ab", count: 32)
-        let host = "https://mac.example"
+        let host = "https://computer.example"
         var object: [String: Any] { ["pushToken": token, "host": host] }
         var date = Date(timeIntervalSince1970: 1_000_000)
         var working = true
@@ -47,14 +47,14 @@ final class AlertPushServiceTests: XCTestCase {
 
     func testPayloadCapsTotalUTF8IncludingEscapingAndUnicode() throws {
         for text in [String(repeating: "👨‍👩‍👧‍👦", count: 1000), String(repeating: "\u{0001}\"\\", count: 2000), "a" + String(repeating: "\u{0301}", count: 10000)] {
-            let payload = try AlertPushService.payload(host: "https://mac.example/" + String(repeating: "h", count: 450), sessionID: String(repeating: "s", count: 256), eventID: String(repeating: "e", count: 256), title: text, text: text)
+            let payload = try AlertPushService.payload(host: "https://computer.example/" + String(repeating: "h", count: 450), sessionID: String(repeating: "s", count: 256), eventID: String(repeating: "e", count: 256), title: text, text: text)
             let data = try JSONSerialization.data(withJSONObject: payload)
             XCTAssertLessThanOrEqual(data.count, 4096)
             XCTAssertNoThrow(try JSONSerialization.jsonObject(with: data))
         }
         XCTAssertThrowsError(try AlertPushService.payload(host: String(repeating: "h", count: 513), sessionID: "s", eventID: "e", title: "title", text: "text"))
-        XCTAssertThrowsError(try AlertPushService.payload(host: "https://mac.example", sessionID: String(repeating: "🦊", count: 65), eventID: "e", title: "title", text: "text"))
-        XCTAssertThrowsError(try AlertPushService.payload(host: "https://mac.example", sessionID: String(repeating: "\u{0001}", count: 256), eventID: String(repeating: "\u{0001}", count: 256), title: "", text: ""))
+        XCTAssertThrowsError(try AlertPushService.payload(host: "https://computer.example", sessionID: String(repeating: "🦊", count: 65), eventID: "e", title: "title", text: "text"))
+        XCTAssertThrowsError(try AlertPushService.payload(host: "https://computer.example", sessionID: String(repeating: "\u{0001}", count: 256), eventID: String(repeating: "\u{0001}", count: 256), title: "", text: ""))
     }
 
     func testDeletedSessionPrunesDeliveredAndWorkingProgress() async throws {

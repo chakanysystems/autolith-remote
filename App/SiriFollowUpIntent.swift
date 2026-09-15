@@ -18,7 +18,7 @@ struct FollowUpAutolithIntent: AppIntent {
             id = session.sessionID
         } else {
             guard let remembered = SiriConversationMemory.identifier(host: connection.host) else {
-                throw connection.failure("No previous Siri conversation on this Mac. Ask Autolith a question first, or choose a session in Shortcuts.")
+                throw connection.failure("No previous Siri conversation on this computer. Ask Autolith a question first, or choose a session in Shortcuts.")
             }
             id = remembered
         }

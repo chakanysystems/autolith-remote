@@ -3,7 +3,7 @@ import Foundation
 enum SiriMessageReceipt {
     enum Failure: LocalizedError {
         case unconfirmed
-        var errorDescription: String? { "The Mac did not confirm this message. Check the conversation before sending again." }
+        var errorDescription: String? { "The computer did not confirm this message. Check the conversation before sending again." }
     }
     static func confirmed(_ ok: Bool?) throws {
         guard ok == true else { throw Failure.unconfirmed }

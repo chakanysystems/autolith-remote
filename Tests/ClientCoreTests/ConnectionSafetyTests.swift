@@ -16,7 +16,7 @@ private actor ConnectionTestGate {
 
 final class ConnectionSafetyTests: XCTestCase {
     private func identity(_ generation: Int = 0, token: String = "fixture") -> ConnectionContext {
-        ConnectionContext(host: "https://mac.example", token: token, generation: generation)
+        ConnectionContext(host: "https://computer.example", token: token, generation: generation)
     }
 
     func testSummarySaturatesUntrustedCounters() {

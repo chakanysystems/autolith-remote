@@ -51,7 +51,7 @@ struct SessionBrowser: View {
             if let id = selectedID, let session = connection.sessions.first(where: { $0.id == id }) {
                 ConversationView(connection: connection, session: session).id(id)
             } else {
-                ContentUnavailableView("Work from anywhere", systemImage: "ipad.and.arrow.forward", description: Text("Select a session or start a new one.\nYour work runs on your Mac."))
+                ContentUnavailableView("Work from anywhere", systemImage: "ipad.and.arrow.forward", description: Text("Select a session or start a new one.\nYour work runs on your computer."))
             }
         }
         .modifier(SiriNavigation(connection: connection, search: $search))
@@ -65,7 +65,7 @@ struct SessionBrowser: View {
             Button("Delete conversation", role: .destructive) { Task { await connection.delete(session) } }
             Button("Cancel", role: .cancel) {}
         } message: { session in
-            Text("This removes ‘\(session.title)’, its saved history, and private attachments from your Mac. It cannot be undone. Workspace files are kept.")
+            Text("This removes ‘\(session.title)’, its saved history, and private attachments from your computer. It cannot be undone. Workspace files are kept.")
         }
         .onChange(of: phase, initial: true) { _, value in connection.setForeground(value != .background) }
         .onDisappear { connection.setForeground(false) }
@@ -142,7 +142,7 @@ struct ConversationView: View {
                         Label("Share conversation", systemImage: "square.and.arrow.up")
                     }
                     Menu("Permissions: \(session.permissions)") {
-                        Button("Ask on Mac") { setPermissions("ask") }
+                        Button("Ask on Computer") { setPermissions("ask") }
                         Button("Automatic approval") { setPermissions("auto") }
                     }.disabled(!session.isRunning)
                     Button("Stop session", systemImage: "stop.circle", role: .destructive) { stopping = true }.disabled(!session.isRunning)
@@ -151,7 +151,7 @@ struct ConversationView: View {
         }
         .confirmationDialog("Stop this session?", isPresented: $stopping, titleVisibility: .visible) {
             Button("Stop session", role: .destructive) { Task { _ = await connection.control("kill", id: session.id) } }
-        } message: { Text("Autolith will shut down this session on your Mac. Its saved conversation remains on the Mac.") }
+        } message: { Text("Autolith will shut down this session on your computer. Its saved conversation remains on the computer.") }
     }
     private func outboxAction(_ operation: String, event: Event) {
         let captured = connection.context
@@ -177,7 +177,7 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Mac connection") {
+                Section("Computer connection") {
                     NavigationLink {
                         ConnectionEditor(connection: connection)
                     } label: {
@@ -225,7 +225,7 @@ struct SettingsView: View {
                     NavigationLink {
                         ConnectionSetupHelp()
                     } label: {
-                        Label("Connect your Mac", systemImage: "questionmark.circle")
+                        Label("Connect your computer", systemImage: "questionmark.circle")
                     }
                 }
             }
@@ -261,23 +261,23 @@ private struct ConnectionEditor: View {
 
     var body: some View {
         Form {
-            Section("Mac connection") {
+            Section("Computer connection") {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Mac address").font(.caption).foregroundStyle(.secondary)
-                    TextField("https://mac.your-tailnet.ts.net", text: $host)
+                    Text("Computer address").font(.caption).foregroundStyle(.secondary)
+                    TextField("https://computer.your-tailnet.ts.net", text: $host)
                         .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
-                        .accessibilityLabel("Mac address")
+                        .accessibilityLabel("Computer address")
                 }
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Companion token").font(.caption).foregroundStyle(.secondary)
-                    SecureField("Token from your Mac", text: $token)
+                    SecureField("Token from your computer", text: $token)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
                         .accessibilityLabel("Companion token")
                 }
             }
 
             Section {
-                Text("Use your Mac’s HTTPS address. The companion token is saved in this device’s Keychain.")
+                Text("Use your computer’s HTTPS address. The companion token is saved in this device’s Keychain.")
             }
 
             if applying {
@@ -295,7 +295,7 @@ private struct ConnectionEditor: View {
             }
 
             Section("Connection status") {
-                LabeledContent("Mac", value: connection.online ? "Connected" : "Disconnected")
+                LabeledContent("Computer", value: connection.online ? "Connected" : "Disconnected")
                 if connection.selection != nil {
                     LabeledContent("Chat updates", value: connection.online ? (connection.streamConnected ? "Live" : "Periodic") : "Disconnected")
                     Text(connection.streamStatus).font(.caption).foregroundStyle(.secondary)
@@ -307,7 +307,7 @@ private struct ConnectionEditor: View {
                 }
             }
         }
-        .navigationTitle("Mac connection")
+        .navigationTitle("Computer connection")
         .navigationBarTitleDisplayMode(.inline)
         .disabled(applying)
         .interactiveDismissDisabled(applying)
@@ -332,7 +332,7 @@ private struct ConnectionEditor: View {
                 connection.error = nil
                 await connection.refresh()
                 if connection.online { dismiss() }
-                else { error = connection.error ?? "Could not connect to the Mac." }
+                else { error = connection.error ?? "Could not connect to the computer." }
             } catch { self.error = error.localizedDescription }
         }
     }
@@ -367,7 +367,7 @@ private struct LiveActivitySettingsPage: View {
                             }
                         }
                     }
-                Text("One activity summarizes your running sessions and tasks. Without Apple push setup on the Mac, updates pause when this app is suspended and the activity shows Update pending.")
+                Text("One activity summarizes your running sessions and tasks. Without Apple push setup on the computer, updates pause when this app is suspended and the activity shows Update pending.")
 
                 if liveActivities {
                     Text(connection.activityStatus)
@@ -396,18 +396,18 @@ private struct LiveActivitySettingsPage: View {
 private struct ConnectionSetupHelp: View {
     var body: some View {
         Form {
-            Section("On your Mac") {
+            Section("On your computer") {
                 Text("Run the Autolith companion and expose port 4318 with Tailscale Serve.")
             }
             Section("On this device") {
-                Text("Connect both devices to Tailscale. Then enter the Mac’s HTTPS address and companion token in Mac connection.")
+                Text("Connect both devices to Tailscale. Then enter the computer’s HTTPS address and companion token in Computer connection.")
             }
             Section {
                 Text("The token is stored in this device’s Keychain.")
                     .foregroundStyle(.secondary)
             }
         }
-        .navigationTitle("Connect your Mac")
+        .navigationTitle("Connect your computer")
     }
 }
 
@@ -419,7 +419,7 @@ struct NewSessionView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Workspace on your Mac") {
+                Section("Workspace on your computer") {
                     NavigationLink { WorkspacePicker(connection: connection, selection: $workspace) } label: {
                         Label(workspace.isEmpty ? "Choose folder…" : workspace, systemImage: "folder")
                     }
@@ -429,12 +429,12 @@ struct NewSessionView: View {
                 }
                 Section("Command permissions") {
                     Picker("Approval", selection: $permissions) {
-                        Text("Ask on Mac").tag("ask")
+                        Text("Ask on Computer").tag("ask")
                         Text("Automatic").tag("auto")
                     }
-                    Text(permissions == "ask" ? "Protected commands require a controlling terminal on the Mac. Use Automatic for unattended work from your iPad." : "Autolith’s permission classifier decides which commands may run with your Mac’s user privileges.")
+                    Text(permissions == "ask" ? "Protected commands require a controlling terminal on the computer. Use Automatic for unattended work from your iPad." : "Autolith’s permission classifier decides which commands may run with your computer’s user privileges.")
                 }
-                if connection.busy { ProgressView("Starting session on Mac…") }
+                if connection.busy { ProgressView("Starting session on your computer…") }
             }.navigationTitle("New session").navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
