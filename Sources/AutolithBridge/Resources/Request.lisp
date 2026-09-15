@@ -167,6 +167,8 @@
                                   :conversation-id (when resume-p (required "id")))))))))
     (json-encode
      (let ((operation (required "operation")))
+       (when (json-get request "requireCurrent")
+         (current-application))
        (cond
          ((string= operation "identity")
           (json-object "id" (application-session-id)))
