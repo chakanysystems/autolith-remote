@@ -83,7 +83,7 @@ public enum PrivateFile {
         defer { acl_free(UnsafeMutableRawPointer(acl)) }
         var entry: acl_entry_t?
         var position = ACL_FIRST_ENTRY
-        while acl_get_entry(acl, position, &entry) == 0 {
+        while acl_get_entry(acl, position.rawValue, &entry) == 0 {
             var tag = ACL_UNDEFINED_TAG
             guard let entry, acl_get_tag_type(entry, &tag) == 0, tag != ACL_EXTENDED_ALLOW else {
                 throw BridgeError.invalid("Credential paths must not grant access through an extended ACL.")

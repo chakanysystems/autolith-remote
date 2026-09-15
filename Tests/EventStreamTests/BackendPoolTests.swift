@@ -80,7 +80,10 @@ final class BackendPoolTests: XCTestCase {
         let context = BackendRequestContext(deadline: .now() + 5)
         let finished = expectation(description: "cancelled")
         DispatchQueue.global().async {
-            XCTAssertThrowsError(try pool.call(Data(#"{"operation":"tell"}"#.utf8), context: context))
+            do {
+                _ = try pool.call(Data(#"{"operation":"tell"}"#.utf8), context: context)
+                XCTFail("Cancelled handshake unexpectedly dispatched a request")
+            } catch {}
             finished.fulfill()
         }
         let limit = Date().addingTimeInterval(2)
@@ -112,11 +115,19 @@ final class BackendPoolTests: XCTestCase {
         XCTAssertEqual(observed, 4)
         XCTAssertThrowsError(try pool.call(Data(#"{"operation":"tell"}"#.utf8), deadline: .now() + 0.1))
         let queued = BackendRequestContext(deadline: .now() + 5)
+        let started = expectation(description: "cancellation thread started")
         let cancelled = expectation(description: "queued cancellation")
-        DispatchQueue.global().async {
-            XCTAssertThrowsError(try pool.call(Data(#"{"operation":"tell"}"#.utf8), context: queued))
+        // Four blocking calls can occupy all global dispatch workers on CI.
+        // Measure cancellation after this thread starts, not dispatch queue delay.
+        Thread.detachNewThread {
+            started.fulfill()
+            do {
+                _ = try pool.call(Data(#"{"operation":"tell"}"#.utf8), context: queued)
+                XCTFail("Cancelled pool waiter unexpectedly dispatched a request")
+            } catch {}
             cancelled.fulfill()
         }
+        wait(for: [started], timeout: 2)
         queued.cancel()
         wait(for: [cancelled], timeout: 0.5)
         contexts.forEach { $0.cancel() }

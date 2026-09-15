@@ -21,6 +21,12 @@ stdenv.mkDerivation {
   preBuild = ''
     export HOME="$TMPDIR/home"
     mkdir -p "$HOME"
+  '' + lib.optionalString stdenv.hostPlatform.isDarwin ''
+    # Foundation's user-directory lookup on Darwin needs more than HOME.
+    export CFFIXED_USER_HOME="$HOME"
+    # The Swift wrapper's process-substitution response file can be closed
+    # before swift-driver reads /dev/fd/63. Pass arguments directly instead.
+    export NIX_CC_USE_RESPONSE_FILE=0
   '';
 
   # Nix's Darwin SwiftPM does not provide Apple's XCTest runner.
