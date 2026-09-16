@@ -41,6 +41,10 @@ struct SessionStream: Sendable {
     private(set) var activityChanged = false
     private var transcriptRevision: String?
 
+    init(sessionID: String) {
+        self.sessionID = sessionID
+    }
+
     mutating func receive(_ data: Data) throws -> Bool {
         transcriptChanged = false
         statusChanged = false
