@@ -189,6 +189,26 @@ struct Reply: Codable, Sendable {
         }
     }
     func failure(_ message: String) -> NSError { NSError(domain: "Autolith", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
+
+    private func sanitizedFailure(_ error: Error) -> Error {
+        if error is CancellationError { return CancellationError() }
+
+        let source = error as NSError
+        if source.domain == NSURLErrorDomain, source.code == URLError.cancelled.rawValue {
+            return CancellationError()
+        }
+
+        return NSError(
+            domain: "Autolith.Connection",
+            code: source.code,
+            userInfo: [
+                NSLocalizedDescriptionKey: source.localizedDescription,
+                "SourceDomain": source.domain,
+                "SourceCode": source.code
+            ]
+        )
+    }
+
     func endpoint() throws -> URL {
         let address = try CompanionEndpoint.canonical(host)
         guard let url = URL(string: address) else { throw failure("Enter the computer's HTTPS address.") }
@@ -196,22 +216,26 @@ struct Reply: Codable, Sendable {
         return url.appendingPathComponent("rpc")
     }
     func call(_ payload: [String: Any], context captured: ConnectionContext? = nil) async throws -> Reply {
-        let identity = captured ?? context
-        var request = URLRequest(url: try identity.endpoint())
-        request.httpMethod = "POST"
-        request.timeoutInterval = 75
-        request.setValue("Bearer \(identity.token)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        let (data, response) = try await BoundedHTTP.data(for: request, limit: BoundedHTTP.limit(operation: payload["operation"] as? String ?? ""))
-        guard response.statusCode == 200 else { throw failure("The computer companion rejected the request (\(response.statusCode)).") }
-        let reply = try await BackgroundWork.run {
-            let interval = PerformanceInterval(.decoding)
-            defer { interval.finish(bytes: data.count) }
-            return try JSONDecoder().decode(Reply.self, from: data)
+        do {
+            let identity = captured ?? context
+            var request = URLRequest(url: try identity.endpoint())
+            request.httpMethod = "POST"
+            request.timeoutInterval = 75
+            request.setValue("Bearer \(identity.token)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+            let (data, response) = try await BoundedHTTP.data(for: request, limit: BoundedHTTP.limit(operation: payload["operation"] as? String ?? ""))
+            guard response.statusCode == 200 else { throw failure("The computer companion rejected the request (\(response.statusCode)).") }
+            let reply = try await BackgroundWork.run {
+                let interval = PerformanceInterval(.decoding)
+                defer { interval.finish(bytes: data.count) }
+                return try JSONDecoder().decode(Reply.self, from: data)
+            }
+            if let message = reply.error { throw failure(message) }
+            return reply
+        } catch {
+            throw sanitizedFailure(error)
         }
-        if let message = reply.error { throw failure(message) }
-        return reply
     }
     func refresh() async {
         guard !switching, !refreshing, !host.isEmpty, !token.isEmpty else { return }
