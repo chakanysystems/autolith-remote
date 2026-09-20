@@ -456,6 +456,6 @@ struct NewSessionView: View {
                     ToolbarItem(placement: .confirmationAction) { Button("Create") { Task { if await connection.create(workspace: workspace, permissions: permissions.argument) { dismiss() } } }.disabled(!workspace.hasPrefix("/") || connection.busy || !connection.online) }
                 }
             .disabled(connection.busy)
-        }.presentationDetents([.medium, .large])
+        }.presentationDetents([.large])
     }
 }
