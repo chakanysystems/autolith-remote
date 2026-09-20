@@ -28,6 +28,13 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
         return result
     }
 
+    var permissionMode: PermissionMode? { PermissionMode(rawValue: permissions) }
+
+    func commandForPermissions(_ mode: PermissionMode) -> String? {
+        guard isRunning else { return nil }
+        return "(permissions \"\(mode.argument)\")"
+    }
+
     func commandForEffort(_ value: String) -> String? {
         guard isRunning, !value.isEmpty, supportedEfforts?.contains(value) == true else { return nil }
         let escaped = value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")

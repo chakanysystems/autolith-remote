@@ -64,6 +64,24 @@ struct SessionComposer: View {
                 .accessibilityIdentifier("composer-model")
                 Spacer(minLength: 0)
                 Menu {
+                    ForEach(PermissionMode.allCases) { mode in
+                        Button {
+                            Task { _ = await connection.selectPermissions(mode, session: session) }
+                        } label: {
+                            if mode == session.permissionMode { Label(mode.title, systemImage: "checkmark") }
+                            else { Text(mode.title) }
+                        }
+                        .accessibilityHint(mode.explanation)
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(session.permissionMode?.title ?? session.permissions).lineLimit(1)
+                        Image(systemName: "chevron.down").font(.caption2)
+                    }.frame(minHeight: 44).contentShape(Rectangle())
+                }
+                .accessibilityLabel("Permissions, \(session.permissionMode?.title ?? session.permissions)")
+                .accessibilityIdentifier("composer-permissions")
+                Menu {
                     ForEach(session.supportedEfforts ?? [], id: \.self) { effort in
                         Button {
                             Task { _ = await connection.selectEffort(effort, session: session) }
