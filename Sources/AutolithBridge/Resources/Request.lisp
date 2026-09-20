@@ -164,6 +164,7 @@
          (let* ((directory (uiop:ensure-directory-pathname (required "workspace")))
                 (mode (json-get request "permissions" "ask"))
                 (permission-mode (cdr (assoc mode '(("ask" . :ask) ("auto" . :auto)
+                                                    ("sandbox" . :sandboxed)
                                                     ("full" . :full-access)) :test #'equal)))
                 (configuration (configuration-create :working-directory directory))
                 (socket (required "managementSocket"))

@@ -427,7 +427,7 @@ struct NewSessionView: View {
     @Bindable var connection: Connection
     @Environment(\.dismiss) private var dismiss
     @State private var workspace = ""
-    @State private var permissions = "ask"
+    @AppStorage("newSessionPermissionMode") private var permissions: PermissionMode = .ask
     var body: some View {
         NavigationStack {
             Form {
@@ -440,18 +440,22 @@ struct NewSessionView: View {
                     }
                 }
                 Section("Command permissions") {
-                    Picker("Approval", selection: $permissions) {
-                        Text("Ask on Computer").tag("ask")
-                        Text("Automatic").tag("auto")
+                    Picker("Permission mode", selection: $permissions) {
+                        ForEach(PermissionMode.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
                     }
-                    Text(permissions == "ask" ? "Protected commands require a controlling terminal on the computer. Use Automatic for unattended work from your iPad." : "Autolith’s permission classifier decides which commands may run with your computer’s user privileges.")
+                    .pickerStyle(.menu)
+                    .accessibilityIdentifier("new-session-permissions")
+                    Text(permissions.explanation)
                 }
                 if connection.busy { ProgressView("Starting session on your computer…") }
             }.navigationTitle("New session").navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
-                    ToolbarItem(placement: .confirmationAction) { Button("Create") { Task { if await connection.create(workspace: workspace, permissions: permissions) { dismiss() } } }.disabled(!workspace.hasPrefix("/") || connection.busy) }
+                    ToolbarItem(placement: .confirmationAction) { Button("Create") { Task { if await connection.create(workspace: workspace, permissions: permissions.argument) { dismiss() } } }.disabled(!workspace.hasPrefix("/") || connection.busy || !connection.online) }
                 }
-        }.presentationDetents([.medium])
+            .disabled(connection.busy)
+        }.presentationDetents([.medium, .large])
     }
 }

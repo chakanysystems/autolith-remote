@@ -587,6 +587,14 @@ struct Reply: Codable, Sendable {
         }
         return await control("tell", id: session.id, message: command)
     }
+    func selectPermissions(_ mode: PermissionMode, session: Session) async -> Bool {
+        guard let current = sessions.first(where: { $0.id == session.id }),
+              let command = current.commandForPermissions(mode) else {
+            error = "Resume this session before changing permissions."
+            return false
+        }
+        return await control("tell", id: session.id, message: command)
+    }
     func control(_ operation: String, id: String, message: String? = nil) async -> Bool {
         guard !switching, !creatingSession, let command = commands.begin(id) else { return false }
         let captured = context
